@@ -229,3 +229,4 @@ Scripts/pyi-makespec.exe
 Scripts/pyi-set_version.exe
 Scripts/pyinstaller.exe
 7dtd_server_tool/core/__init__.py
+/.tmp.driveupload
