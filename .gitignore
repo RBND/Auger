@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.tmp.driveupload/2965
+.tmp.driveupload/2967
+.tmp.driveupload/2969
+Scripts/pip.exe
+Scripts/pip3.13.exe
+Scripts/pip3.exe
+Scripts/pyi-archive_viewer.exe
+Scripts/pyi-bindepend.exe
+Scripts/pyi-grab_version.exe
+Scripts/pyi-makespec.exe
+Scripts/pyi-set_version.exe
+Scripts/pyinstaller.exe
+7dtd_server_tool/core/__init__.py
