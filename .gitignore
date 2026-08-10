@@ -216,9 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-.tmp.driveupload/2965
-.tmp.driveupload/2967
-.tmp.driveupload/2969
 Scripts/pip.exe
 Scripts/pip3.13.exe
 Scripts/pip3.exe
