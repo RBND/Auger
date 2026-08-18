@@ -337,7 +337,7 @@ class MainWindow:
 
         ttk.Label(
             header_frame,
-            text="v1.0.0 Beta",
+            text="v1.20 Beta",
             font=("Segoe UI", 9, "italic"),
         ).pack(side=tk.RIGHT, padx=5)
 
