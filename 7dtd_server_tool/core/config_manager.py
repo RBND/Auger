@@ -2,7 +2,9 @@
 XML Parsing, Reading, Saving, Backup, and Resetting for 7 Days to Die serverconfig.xml.
 """
 
+import os
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -200,14 +202,24 @@ class ConfigManager:
         except AttributeError:
             pass
 
+        temp_path: Optional[Path] = None
         try:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.config_path, "wb") as f:
-                f.write(b'<?xml version="1.0"?>\n')
-                self.tree.write(f, encoding="utf-8", xml_declaration=False)
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=self.config_path.parent, delete=False
+            ) as handle:
+                temp_path = Path(handle.name)
+                handle.write(b'<?xml version="1.0"?>\n')
+                self.tree.write(handle, encoding="utf-8", xml_declaration=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.config_path)
             return True
         except Exception as err:
             raise IOError(f"Failed to save serverconfig.xml: {err}") from err
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
 
     def reset_to_defaults(self, make_backup: bool = True) -> bool:
         """Restores configuration to default settings."""

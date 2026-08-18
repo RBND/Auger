@@ -6,14 +6,15 @@ Pipes process logs safely into a thread-safe queue.Queue for GUI updates.
 import os
 import platform
 import queue
-import shutil
+import re
 import subprocess
 import tarfile
+import tempfile
 import threading
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Optional, Union, Callable
+from typing import Callable, Optional, Union
 
 from .utils import get_app_dir, get_executable_name
 
@@ -90,6 +91,8 @@ class InstallationManager:
     STEAMCMD_WIN_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
     STEAMCMD_LINUX_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
     GAME_APP_ID = "294420"
+    DOWNLOAD_TIMEOUT_SECONDS = 60
+    BRANCH_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
     def __init__(self, log_queue: queue.Queue):
         self.log_queue = log_queue
@@ -105,6 +108,80 @@ class InstallationManager:
 
     def is_busy(self) -> bool:
         return self._is_running
+
+    @classmethod
+    def build_app_update_argument(
+        cls,
+        branch: str = "public",
+        beta_password: Optional[str] = None,
+        validate: bool = True,
+    ) -> str:
+        """Build the single SteamCMD app_update argument safely.
+
+        SteamCMD retains the last selected beta branch.  Supplying ``public``
+        explicitly therefore also makes switching back to the stable server
+        reliable.
+        """
+        normalized_branch = branch.strip()
+        if not cls.BRANCH_PATTERN.fullmatch(normalized_branch):
+            raise ValueError(
+                "The server branch must be 1-64 letters, numbers, dots, underscores, or hyphens."
+            )
+        if beta_password and any(char in beta_password for char in "\r\n\x00"):
+            raise ValueError("The beta password contains unsupported characters.")
+
+        parts = [cls.GAME_APP_ID, "-beta", normalized_branch]
+        if beta_password:
+            parts.extend(["-betapassword", beta_password])
+        if validate:
+            parts.append("validate")
+        return " ".join(parts)
+
+    @staticmethod
+    def _safe_archive_destination(destination: Path, member_name: str) -> Path:
+        """Return a destination only when an archive member stays in its folder."""
+        root = destination.resolve()
+        candidate = (root / member_name).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError(f"Archive member escapes the destination: {member_name}")
+        return candidate
+
+    @classmethod
+    def _extract_zip_safely(cls, archive_path: Path, destination: Path) -> None:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            for member in archive.infolist():
+                cls._safe_archive_destination(destination, member.filename)
+                # A Unix symlink is encoded in the upper file attributes.
+                if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise ValueError(f"Refusing symlink in archive: {member.filename}")
+            archive.extractall(destination)
+
+    @classmethod
+    def _extract_tar_safely(cls, archive_path: Path, destination: Path) -> None:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            members = archive.getmembers()
+            for member in members:
+                cls._safe_archive_destination(destination, member.name)
+                if not (member.isfile() or member.isdir()):
+                    raise ValueError(f"Refusing unsafe archive member: {member.name}")
+            archive.extractall(destination, members=members)
+
+    def _download_file(
+        self,
+        url: str,
+        destination: Path,
+        report_progress: Callable[[int, int], None],
+    ) -> None:
+        """Download an HTTPS file with a timeout and progress reporting."""
+        request = urllib.request.Request(url, headers={"User-Agent": "Auger/1.1"})
+        with urllib.request.urlopen(request, timeout=self.DOWNLOAD_TIMEOUT_SECONDS) as response:
+            content_length = int(response.headers.get("Content-Length", "0"))
+            downloaded = 0
+            with open(destination, "wb") as handle:
+                while chunk := response.read(1024 * 128):
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    report_progress(downloaded, content_length)
 
     def _run_steamcmd_hidden(
         self,
@@ -194,28 +271,30 @@ class InstallationManager:
             download_url = (
                 self.STEAMCMD_WIN_URL if is_windows else self.STEAMCMD_LINUX_URL
             )
-            archive_path = dest_dir / ("steamcmd.zip" if is_windows else "steamcmd.tar.gz")
+            archive_suffix = ".zip" if is_windows else ".tar.gz"
+            with tempfile.NamedTemporaryFile(
+                dir=dest_dir, suffix=archive_suffix, delete=False
+            ) as handle:
+                archive_path = Path(handle.name)
 
             last_percent = -1
 
-            def _report_hook(block_num: int, block_size: int, total_size: int):
+            def _report_progress(downloaded: int, total_size: int) -> None:
                 nonlocal last_percent
                 if total_size > 0:
-                    percent = int(min(100.0, (block_num * block_size / total_size) * 100))
+                    percent = int(min(100.0, (downloaded / total_size) * 100))
                     if percent != last_percent and (percent % 5 == 0 or percent == 100):
                         last_percent = percent
                         self.log(f"Downloading: {percent}%", "INFO")
 
-            urllib.request.urlretrieve(download_url, archive_path, reporthook=_report_hook)
+            self._download_file(download_url, archive_path, _report_progress)
             self.log("Download completed. Extracting files...", "SUCCESS")
 
             self.status_update("steamcmd", "Extracting...")
             if is_windows or str(archive_path).endswith(".zip"):
-                with zipfile.ZipFile(archive_path, "r") as zip_ref:
-                    zip_ref.extractall(dest_dir)
+                self._extract_zip_safely(archive_path, dest_dir)
             else:
-                with tarfile.open(archive_path, "r:gz") as tar_ref:
-                    tar_ref.extractall(dest_dir)
+                self._extract_tar_safely(archive_path, dest_dir)
 
             if archive_path.exists():
                 archive_path.unlink()
@@ -259,6 +338,8 @@ class InstallationManager:
         self,
         steamcmd_path: Path,
         server_dir: Path,
+        branch: str = "public",
+        beta_password: Optional[str] = None,
         validate: bool = True,
         on_complete: Optional[Callable[[bool], None]] = None,
     ) -> None:
@@ -269,7 +350,7 @@ class InstallationManager:
 
         thread = threading.Thread(
             target=self._install_or_update_server_worker,
-            args=(steamcmd_path, server_dir, validate, on_complete),
+            args=(steamcmd_path, server_dir, branch, beta_password, validate, on_complete),
             daemon=True,
         )
         thread.start()
@@ -278,6 +359,8 @@ class InstallationManager:
         self,
         steamcmd_path: Path,
         server_dir: Path,
+        branch: str,
+        beta_password: Optional[str],
         validate: bool,
         on_complete: Optional[Callable[[bool], None]],
     ) -> None:
@@ -285,7 +368,13 @@ class InstallationManager:
         try:
             server_dir.mkdir(parents=True, exist_ok=True)
             self.status_update("server", "Downloading / Updating...")
-            self.log(f"Starting 7DTD Server download/update in {server_dir}...", "INFO")
+            self.log(
+                f"Starting 7DTD Server download/update from the '{branch}' branch in {server_dir}...",
+                "INFO",
+            )
+            app_update_argument = self.build_app_update_argument(
+                branch=branch, beta_password=beta_password, validate=validate
+            )
 
             cmd = [
                 str(steamcmd_path),
@@ -294,14 +383,16 @@ class InstallationManager:
                 "+force_install_dir",
                 str(server_dir),
                 "+app_update",
-                self.GAME_APP_ID,
+                app_update_argument,
             ]
-
-            if validate:
-                cmd.append("validate")
             cmd.append("+quit")
 
-            self.log(f"Executing: {' '.join(cmd)}", "INFO")
+            # Do not log the raw command: a password for a private branch would be exposed.
+            self.log(
+                f"Requesting app {self.GAME_APP_ID} branch '{branch}'"
+                f"{' with validation' if validate else ''}.",
+                "INFO",
+            )
 
             def _on_server_line(clean_line: str):
                 if "Error" in clean_line or "FAILED" in clean_line:

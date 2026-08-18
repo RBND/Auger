@@ -22,6 +22,17 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def get_app_data_dir() -> Path:
+    """Return the writable, per-user directory used for Auger settings."""
+    current_os = platform.system()
+    if current_os == "Windows":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return base / "Auger"
+    if current_os == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "Auger"
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "auger"
+
+
 def setup_tcl_tk_env() -> None:
     """
     Locates and sets TCL_LIBRARY and TK_LIBRARY environment variables
@@ -41,13 +52,19 @@ def setup_tcl_tk_env() -> None:
             os.environ["TK_LIBRARY"] = str(tk_path)
         return
 
-    # 2. Check candidate system paths
+    # 2. Check candidate system paths (Windows + Linux)
     candidate_tcl_roots = [
+        # Windows paths
         Path(sys.prefix) / "tcl",
         Path(sys.base_prefix) / "tcl",
         Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Python/Python313/tcl",
         Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Python/Python312/tcl",
         Path("C:/Python313/tcl"),
+        # Linux paths — each entry is the parent of tcl8.6/ and tk8.6/
+        Path("/usr/lib"),              # /usr/lib/tcl8.6 and /usr/lib/tk8.6
+        Path("/usr/share/tcltk"),      # /usr/share/tcltk/tcl8.6 and /usr/share/tcltk/tk8.6
+        Path(sys.prefix) / "lib",      # venv-local: <venv>/lib/tcl8.6
+        Path(sys.base_prefix) / "lib", # system Python: /usr/local/lib/tcl8.6
     ]
 
     for root in candidate_tcl_roots:

@@ -19,10 +19,22 @@ from core.utils import (
     launch_detached_process,
     open_folder,
 )
-from core.settings_store import get_saved_path, save_settings
+from core.settings_store import get_saved_path, get_saved_value, save_settings
 from gui.views import LoggerTextBox, SteamCMDMissingModal
 
 PLATFORM_OPTIONS = ["Steam", "EOS", "XBL", "PSN"]
+SERVER_BRANCH_STABLE = "Stable (public)"
+SERVER_BRANCH_EXPERIMENTAL = "Latest Experimental"
+SERVER_BRANCH_CUSTOM = "Custom branch"
+SERVER_BRANCH_OPTIONS = [
+    SERVER_BRANCH_STABLE,
+    SERVER_BRANCH_EXPERIMENTAL,
+    SERVER_BRANCH_CUSTOM,
+]
+SERVER_BRANCH_VALUES = {
+    SERVER_BRANCH_STABLE: "public",
+    SERVER_BRANCH_EXPERIMENTAL: "latest_experimental",
+}
 # Dropdown options for config fields with a small discrete set of choices
 # ---------------------------------------------------------------------------
 DROPDOWN_OPTIONS: Dict[str, List[str]] = {
@@ -287,6 +299,23 @@ class MainWindow:
         self.server_path_var = tk.StringVar(value="Searching...")
         self.server_status_var = tk.StringVar(value="Checking...")
 
+        saved_branch = str(get_saved_value("server_branch", "public")).strip()
+        if saved_branch == "public":
+            saved_branch_choice = SERVER_BRANCH_STABLE
+            custom_branch = ""
+        elif saved_branch == "latest_experimental":
+            saved_branch_choice = SERVER_BRANCH_EXPERIMENTAL
+            custom_branch = ""
+        else:
+            saved_branch_choice = SERVER_BRANCH_CUSTOM
+            custom_branch = saved_branch
+        self.server_branch_choice_var = tk.StringVar(value=saved_branch_choice)
+        self.custom_branch_var = tk.StringVar(value=custom_branch)
+        self.beta_password_var = tk.StringVar()
+        self.validate_server_files_var = tk.BooleanVar(
+            value=bool(get_saved_value("validate_server_files", True))
+        )
+
         self._build_ui()
 
         # Start periodic Queue Polling loop
@@ -376,12 +405,53 @@ class MainWindow:
         )
         self.btn_dl_server.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
 
+        version_group = ttk.LabelFrame(
+            self.tab_control, text=" Server Version ", padding=12
+        )
+        version_group.pack(fill=tk.X, pady=(0, 10))
+
+        version_row = ttk.Frame(version_group)
+        version_row.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(version_row, text="Version / branch:", width=20, anchor=tk.W).pack(side=tk.LEFT)
+        self.server_branch_selector = ttk.Combobox(
+            version_row,
+            textvariable=self.server_branch_choice_var,
+            values=SERVER_BRANCH_OPTIONS,
+            state="readonly",
+            width=24,
+        )
+        self.server_branch_selector.pack(side=tk.LEFT, padx=(0, 12))
+        self.server_branch_selector.bind("<<ComboboxSelected>>", self._on_branch_selection_changed)
+        ttk.Checkbutton(
+            version_row,
+            text="Validate files after download",
+            variable=self.validate_server_files_var,
+        ).pack(side=tk.LEFT)
+
+        custom_row = ttk.Frame(version_group)
+        custom_row.pack(fill=tk.X, pady=2)
+        ttk.Label(custom_row, text="Custom branch:", width=20, anchor=tk.W).pack(side=tk.LEFT)
+        self.custom_branch_entry = ttk.Entry(
+            custom_row, textvariable=self.custom_branch_var, width=28
+        )
+        self.custom_branch_entry.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(custom_row, text="Use only a branch published by the game developer.").pack(side=tk.LEFT)
+
+        password_row = ttk.Frame(version_group)
+        password_row.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(password_row, text="Beta password:", width=20, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Entry(password_row, textvariable=self.beta_password_var, show="•", width=28).pack(
+            side=tk.LEFT, padx=(0, 12)
+        )
+        ttk.Label(password_row, text="Optional. Never saved or shown in logs.").pack(side=tk.LEFT)
+        self._on_branch_selection_changed()
+
         launch_group = ttk.LabelFrame(self.tab_control, text=" Quick Launch ", padding=12)
         launch_group.pack(fill=tk.X, pady=(0, 10))
 
         ttk.Label(
             launch_group,
-            text="Launch the server using startdedicated.bat in the server installation folder.",
+            text="Launch the 7DTD Dedicated Server from the server installation folder.",
         ).pack(anchor=tk.W, pady=(0, 10))
 
         self.btn_start_server = ttk.Button(
@@ -887,6 +957,28 @@ class MainWindow:
 
         self.installer.download_and_setup_steamcmd_async(target_dir=target_dir, on_complete=_on_done)
 
+    def _on_branch_selection_changed(self, event: Optional[tk.Event] = None) -> None:
+        """Enables or disables the custom branch entry based on current dropdown selection."""
+        choice = self.server_branch_choice_var.get()
+        if choice == SERVER_BRANCH_CUSTOM:
+            self.custom_branch_entry.config(state=tk.NORMAL)
+        else:
+            self.custom_branch_entry.config(state=tk.DISABLED)
+
+    def get_selected_branch(self) -> Optional[str]:
+        """Returns the normalized branch name to use for SteamCMD, or None if invalid."""
+        choice = self.server_branch_choice_var.get()
+        if choice == SERVER_BRANCH_CUSTOM:
+            branch = self.custom_branch_var.get().strip()
+            if not branch:
+                messagebox.showerror(
+                    "Branch Name Required",
+                    "Please enter a valid custom branch name or select Stable / Latest Experimental.",
+                )
+                return None
+            return branch
+        return SERVER_BRANCH_VALUES.get(choice, "public")
+
     def action_install_server(self) -> None:
         if not self.steamcmd_path or not self.steamcmd_path.exists():
             messagebox.showerror(
@@ -895,10 +987,18 @@ class MainWindow:
             )
             return
 
+        branch = self.get_selected_branch()
+        if not branch:
+            return
+
+        beta_password = self.beta_password_var.get().strip() or None
+        validate = self.validate_server_files_var.get()
+
         target_dir: Optional[Path] = None
 
+        _server_binary = get_executable_name("7DaysToDieServer")
         if self.server_dir and self.server_dir.exists() and (
-            (self.server_dir / "7DaysToDieServer.exe").exists()
+            (self.server_dir / _server_binary).exists()
             or (self.server_dir / "startdedicated.bat").exists()
             or (self.server_dir / "startserver.bat").exists()
         ):
@@ -928,6 +1028,8 @@ class MainWindow:
                 return
             target_dir = Path(target_dir_str).resolve()
 
+        save_settings(server_branch=branch, validate_server_files=validate)
+
         def _on_done(success: bool):
             if success:
                 self._set_server_dir(target_dir)
@@ -935,7 +1037,9 @@ class MainWindow:
         self.installer.install_or_update_server_async(
             steamcmd_path=self.steamcmd_path,
             server_dir=target_dir,
-            validate=True,
+            branch=branch,
+            beta_password=beta_password,
+            validate=validate,
             on_complete=_on_done,
         )
 
@@ -966,9 +1070,10 @@ class MainWindow:
             launch_detached_process(cmd, cwd=self.server_dir)
             messagebox.showinfo("Server Started", f"Server launched: {exe_file.name}")
         else:
+            _binary_name = get_executable_name("7DaysToDieServer")
             messagebox.showerror(
                 "Binary Not Found",
-                "Could not locate startdedicated.bat, startserver.bat, or 7DaysToDieServer.exe.",
+                f"Could not locate startdedicated.bat, startserver.bat, or {_binary_name}.",
             )
 
     # ------------------------------------------------------------------
