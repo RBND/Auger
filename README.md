@@ -138,3 +138,9 @@ Auger(Python)/
   chmod +x "Start_Server_Manager(LINUX).sh"
   ```
 - Ensure the destination directory for your server files is writable by your current user.
+
+### `Could not find platform independent libraries <prefix>` on Windows
+- This warning occurs when a system-wide `PYTHONHOME` or `PYTHONPATH` environment variable points to an older, different, or moved Python installation.
+- The included [`Start_Server_Manager(WINDOWS).bat`](file:///c:/Users/Myke/Documents/GitHub/Auger/Start_Server_Manager%28WINDOWS%29.bat) automatically clears `PYTHONHOME` for its session to avoid this issue.
+- To fix it globally, search Windows for **"Edit the system environment variables"**, click **Environment Variables...**, and remove any obsolete `PYTHONHOME` entry under User or System variables.
+

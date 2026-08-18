@@ -1,6 +1,9 @@
 @echo off
 setlocal
 
+REM Clear any invalid system-wide PYTHONHOME variable that causes Python startup warnings.
+set "PYTHONHOME="
+
 REM Change to the directory where this batch file is located.
 cd /d "%~dp0"
 
