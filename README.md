@@ -1,4 +1,4 @@
-# Auger — 7 Days to Die Dedicated Server Manager
+# Auger - A 7 Days to Die Dedicated Server Manager
 
 Auger is a cross-platform Python desktop application designed to streamline installing, updating, configuring, and managing a **7 Days to Die Dedicated Server**.
 
