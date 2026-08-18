@@ -1,2 +1,0 @@
-# Development dependencies for building stand-alone executable
-pyinstaller>=6.0.0
