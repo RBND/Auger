@@ -58,7 +58,8 @@ DROPDOWN_OPTIONS: Dict[str, List[str]] = {
     "IgnoreEOSSanctions": ["false", "true"],
     "HideCommandExecutionLog": ["0", "1", "2", "3"],
     "PersistentPlayerProfiles": ["false", "true"],
-    "GameWorld": ["Navezgane", "Pregen06k01", "Pregen06k02", "Pregen08k01", "Pregen08k02", "RWG"],
+    #"GameWorld": ["Navezgane", "Pregen06k01", "Pregen06k02", "Pregen08k01", "Pregen08k02", "RWG"], 
+    # #Removed to allow for custom worlds.
     "WorldGenSize": ["6144", "8192", "10240"],
     "GameMode": ["GameModeSurvival"],
     "BuildCreate": ["false", "true"],
@@ -337,7 +338,7 @@ class MainWindow:
 
         ttk.Label(
             header_frame,
-            text="v1.20 Beta",
+            text="v1.21 Beta",
             font=("Segoe UI", 9, "italic"),
         ).pack(side=tk.RIGHT, padx=5)
 

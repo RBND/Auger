@@ -231,3 +231,4 @@ Scripts/pyinstaller.exe
 *.exe
 *.rar
 *.zip
+.vscode/settings.json
