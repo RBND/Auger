@@ -6,10 +6,13 @@ Auger is a cross-platform Python desktop application designed to streamline inst
 
 ## Features
 
-- **SteamCMD & Server Installation / Updating:** Automatically downloads SteamCMD and installs or updates the 7DTD dedicated server (supports Public Stable, Latest Experimental, and Custom branch builds).
+- **Server Installation / Updating:** Automatically downloads the right tool for your OS (**SteamCMD** on Windows, **DepotDownloader** on Linux) and installs or updates the 7DTD dedicated server (supports Public Stable, Latest Experimental, and Custom branch builds). Your `serverconfig.xml` is backed up and restored around every update.
 - **Configuration Management:** Interactive editor for `serverconfig.xml` with tooltips, grouped sections, validation, backups, and reset options.
+- **Gameplay Rules (Sandbox Code):** Paste the code from the game's Sandbox Options screen with one click. See the step-by-step [Sandbox Code Guide](docs/SANDBOX_CODE_GUIDE.md).
 - **Admin & Permission Manager:** Manage server admins, moderators, whitelist, blacklist, and custom command permission levels for `serveradmin.xml`.
-- **One-Click Server Launching:** Launch your dedicated server in an independent console session and open server directories directly.
+- **One-Click Server Launching:** Starts the server directly (no `.bat`/`.sh` wrappers) and shows whether it is running.
+- **Headless / CLI Mode:** Includes a command-line interface (`python -m core.cli`) for headless Linux servers or scripting without a GUI.
+- **Isolated Configuration:** Operates with a dedicated `serverconfig.auger.xml` and isolated instance userdata, preventing Steam updates and validations from overwriting custom rules.
 - **No Third-Party Dependencies:** Built entirely with the Python Standard Library (`tkinter`, `xml.etree.ElementTree`, `subprocess`, `urllib`, etc.).
 
 ---
@@ -40,7 +43,7 @@ Auger is a cross-platform Python desktop application designed to streamline inst
    - During installation, make sure to check **"Add python.exe to PATH"** and ensure **tcl/tk and IDLE** is checked under Optional Features.
 2. **Open Command Prompt / PowerShell:**
    ```cmd
-   cd "C:\path\to\Auger(Python)"
+   cd "C:\path\to\Auger"
    ```
 3. **Launch the application:**
    ```cmd
@@ -54,24 +57,24 @@ Auger is a cross-platform Python desktop application designed to streamline inst
 
 ### 1. Install System Dependencies
 
-On Linux, Python does not always include the `tkinter` package by default. In addition, SteamCMD requires 32-bit compatibility libraries.
+On Linux, Python does not always include the `tkinter` package by default. (32-bit libraries are **not** needed: Auger downloads the server with the 64-bit DepotDownloader instead of SteamCMD on Linux.)
 
-Install the required packages for your distribution:
+Install the required packages for your distribution (the quick-launch script below does this for you):
 
 - **Ubuntu / Debian / Linux Mint:**
   ```bash
   sudo apt update
-  sudo apt install -y python3 python3-tk lib32gcc-s1
+  sudo apt install -y python3 python3-tk
   ```
 
 - **Fedora / RHEL / CentOS:**
   ```bash
-  sudo dnf install -y python3 python3-tkinter glibc.i686 libstdc++.i686
+  sudo dnf install -y python3 python3-tkinter
   ```
 
 - **Arch Linux / Manjaro:**
   ```bash
-  sudo pacman -Syu --needed python tk lib32-gcc-libs
+  sudo pacman -S --needed python tk
   ```
 
 ### Option 1: Quick Launch (Shell Script)
@@ -90,7 +93,7 @@ Install the required packages for your distribution:
 
 1. Open a terminal and navigate to the application folder:
    ```bash
-   cd /path/to/Auger\(Python\)
+   cd /path/to/Auger
    ```
 2. Run the main script with Python 3:
    ```bash
@@ -99,25 +102,73 @@ Install the required packages for your distribution:
 
 ---
 
+## Headless / CLI Execution
+
+For headless Linux servers or automation, Auger can be operated without the GUI via `core.cli`:
+
+```bash
+# Check detected tools, server path, and installation status
+python3 -m core.cli status
+
+# Download the download tool and install the server
+python3 -m core.cli setup
+
+# Update server (supports optional --branch and --validate)
+python3 -m core.cli update --branch latest_experimental --validate
+
+# Apply a gameplay rules Sandbox Code
+python3 -m core.cli set-sandbox-code AAAJABJACJADJARFBNC
+
+# Launch the dedicated server and follow its status
+python3 -m core.cli start
+```
+
 ## Directory Structure
 
 ```text
-Auger(Python)/
+Auger/
 ├── main.py                           # Application entry point
 ├── Start_Server_Manager(WINDOWS).bat # Quick launcher for Windows
 ├── Start_Server_Manager(LINUX).sh    # Quick launcher for Linux
 ├── core/
 │   ├── __init__.py
 │   ├── admin_manager.py              # serveradmin.xml reader/writer
-│   ├── config_manager.py             # serverconfig.xml reader/writer
-│   ├── detector.py                   # SteamCMD & 7DTD auto-detection
-│   ├── installer.py                  # Asynchronous SteamCMD / server updater
+│   ├── cli.py                        # Headless command-line interface
+│   ├── config_manager.py             # serverconfig.xml reader/writer, Sandbox Code cleanup
+│   ├── config_schema.py              # Server configuration schema & validation
+│   ├── detector.py                   # Download tool & 7DTD auto-detection
+│   ├── downloaders.py                # SteamCMD / DepotDownloader commands & output parsing
+│   ├── installer.py                  # Asynchronous tool setup & server install/update
+│   ├── instance.py                   # Server instance config & userdata management
+│   ├── server_launcher.py            # Starts the server directly and tracks if it is running
+│   ├── service.py                    # Service coordinator
 │   ├── settings_store.py             # Persistent user settings store
-│   └── utils.py                      # Platform helpers, DPI awareness, process launchers
-└── gui/
-    ├── __init__.py
-    ├── main_window.py                # Main application window & tabs
-    └── views.py                      # Custom UI widgets, log viewer, modals
+│   └── utils.py                      # Platform helpers, DPI awareness, paths
+├── gui/
+│   ├── __init__.py
+│   ├── main_window.py                # Main application window & tabs
+│   └── views.py                      # Custom UI widgets, log viewer, dialogs
+├── docs/
+│   └── SANDBOX_CODE_GUIDE.md         # How to create and paste a Sandbox Code
+└── tests/                            # Unit tests (python -m unittest discover -s tests -t .)
+```
+
+### Where Auger puts files by default
+
+| | Windows | Linux |
+|---|---|---|
+| Download tool | `%LOCALAPPDATA%\Auger\steamcmd` | `~/.local/share/auger/depotdownloader` |
+| Server files | `%LOCALAPPDATA%\Auger\instances\default\server` | `~/.local/share/auger/instances/default/server` |
+| Saves & User Data | `%LOCALAPPDATA%\Auger\instances\default\userdata` | `~/.local/share/auger/instances/default/userdata` |
+
+*(Auger also automatically detects existing servers installed in legacy paths like `%LOCALAPPDATA%\Auger\7dtd_server` or standard Steam libraries.)*
+
+To install somewhere else, click **📁 Browse** next to *7DTD Server Folder* before clicking *Install / Update*.
+
+### Running the tests
+
+```bash
+python -m unittest discover -s tests -t . -v
 ```
 
 ---
@@ -128,9 +179,9 @@ Auger(Python)/
 - **Linux:** Install the Tkinter package for Python (e.g., `sudo apt install python3-tk` or `sudo dnf install python3-tkinter`).
 - **Windows:** Re-run the Python installer, select **Modify**, and make sure **tcl/tk and IDLE** is checked.
 
-### SteamCMD Fails to Run on 64-bit Linux
-- SteamCMD is a 32-bit executable and requires 32-bit runtime libraries.
-- Run `sudo apt install lib32gcc-s1` (Ubuntu/Debian) or `sudo dnf install glibc.i686 libstdc++.i686` (Fedora/RHEL).
+### DepotDownloader fails to start on Linux
+- Auger downloads the self-contained 64-bit DepotDownloader, so no .NET install or 32-bit libraries are needed.
+- If it still fails, make sure the folder isn't on a drive mounted with `noexec`, and that basic system libraries (e.g. `libssl`) are installed.
 
 ### Permission Denied on Linux
 - If `./Start_Server_Manager(LINUX).sh` gives a permission error, run:

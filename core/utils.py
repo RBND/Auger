@@ -108,6 +108,56 @@ def get_executable_name(base_name: str) -> str:
     return base_name
 
 
+def is_windows() -> bool:
+    """Return True when running on Windows."""
+    return platform.system() == "Windows"
+
+
+def get_data_dir() -> Path:
+    """Return the writable, per-user directory for large data (tools, server files).
+
+    Windows: %LOCALAPPDATA%\\Auger   Linux: $XDG_DATA_HOME/auger (~/.local/share/auger)
+    """
+    if is_windows():
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return base / "Auger"
+    if platform.system() == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "Auger"
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "auger"
+
+
+def steamcmd_binary_name() -> str:
+    """SteamCMD entry point: steamcmd.exe on Windows, the steamcmd.sh wrapper on Linux."""
+    return "steamcmd.exe" if is_windows() else "steamcmd.sh"
+
+
+def game_default_userdata_dir() -> Path:
+    """Where the 7DTD server keeps saves when serverconfig's UserDataFolder is not set."""
+    if is_windows():
+        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "7DaysToDie"
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "7DaysToDie"
+
+
+def depotdownloader_binary_name() -> str:
+    """DepotDownloader entry point inside its release zip."""
+    return "DepotDownloader.exe" if is_windows() else "DepotDownloader"
+
+
+def server_binary_name() -> str:
+    """7 Days to Die dedicated server executable for the current OS."""
+    return "7DaysToDieServer.exe" if is_windows() else "7DaysToDieServer.x86_64"
+
+
+def ensure_executable(path: Union[Path, str]) -> None:
+    """Add the executable bit on POSIX systems (zip extraction drops it)."""
+    if is_windows():
+        return
+    target = Path(path)
+    if target.is_file():
+        mode = target.stat().st_mode
+        target.chmod(mode | 0o755)
+
+
 def open_folder(target_path: Union[Path, str]) -> bool:
     """
     Opens the specified folder in the platform's default file manager
@@ -162,47 +212,4 @@ def launch_detached_process(
         return True
     except Exception as err:
         print(f"[Error] Failed to launch process {cmd}: {err}", file=sys.stderr)
-        return False
-
-
-def launch_batch_in_new_window(
-    bat_path: Union[Path, str],
-    cwd: Optional[Union[Path, str]] = None,
-    window_title: str = "7DTD Dedicated Server",
-) -> bool:
-    """
-    Opens a .bat file in a new visible console window on Windows.
-    Uses cmd.exe start so the window behaves like a double-click launch.
-    """
-    bat = Path(bat_path).resolve()
-    work_dir = Path(cwd).resolve() if cwd else bat.parent
-
-    if not bat.exists():
-        print(f"[Error] Batch file not found: {bat}", file=sys.stderr)
-        return False
-
-    try:
-        if platform.system() == "Windows":
-            subprocess.Popen(
-                [
-                    "cmd.exe",
-                    "/c",
-                    "start",
-                    window_title,
-                    "/D",
-                    str(work_dir),
-                    str(bat),
-                ],
-                cwd=str(work_dir),
-                shell=False,
-            )
-        else:
-            subprocess.Popen(
-                ["bash", str(bat)],
-                cwd=str(work_dir),
-                start_new_session=True,
-            )
-        return True
-    except Exception as err:
-        print(f"[Error] Failed to launch batch file {bat}: {err}", file=sys.stderr)
         return False

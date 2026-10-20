@@ -232,3 +232,4 @@ Scripts/pyinstaller.exe
 *.rar
 *.zip
 .vscode/settings.json
+repomix-output.*

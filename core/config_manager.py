@@ -3,103 +3,39 @@ XML Parsing, Reading, Saving, Backup, and Resetting for 7 Days to Die serverconf
 """
 
 import os
+import re
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Optional
+
+from .config_schema import GROUPS, default_values
+
+_SANDBOX_XML_VALUE = re.compile(r'name\s*=\s*"SandboxCode"[^>]*?value\s*=\s*"([^"]*)"', re.IGNORECASE)
+_SANDBOX_ALLOWED = re.compile(r"[A-Za-z0-9+/=_.\-]{1,4096}")
 
 
-# Default configuration dictionary — covers every property in the standard serverconfig.xml
-DEFAULT_CONFIG: Dict[str, str] = {
-    # --- Server Representation ---
-    "ServerName": "My Game Host",
-    "ServerDescription": "A 7 Days to Die server",
-    "ServerWebsiteURL": "",
-    "ServerPassword": "",
-    "ServerLoginConfirmationText": "",
-    "Region": "NorthAmericaEast",
-    "Language": "English",
-    # --- Networking ---
-    "ServerPort": "26900",
-    "ServerVisibility": "2",
-    "ServerDisabledNetworkProtocols": "",
-    "ServerMaxWorldTransferSpeedKiBs": "512",
-    # --- Slots ---
-    "ServerMaxPlayerCount": "8",
-    "ServerReservedSlots": "0",
-    "ServerReservedSlotsPermission": "100",
-    "ServerAdminSlots": "0",
-    "ServerAdminSlotsPermission": "0",
-    # --- Web Dashboard ---
-    "WebDashboardEnabled": "false",
-    "WebDashboardPort": "8080",
-    "WebDashboardUrl": "",
-    "EnableMapRendering": "false",
-    # --- Telnet ---
-    "TelnetEnabled": "true",
-    "TelnetPort": "8081",
-    "TelnetPassword": "",
-    "TelnetFailedLoginLimit": "10",
-    "TelnetFailedLoginsBlocktime": "10",
-    # --- Terminal ---
-    "TerminalWindowEnabled": "true",
-    # --- File Locations ---
-    "AdminFileName": "serveradmin.xml",
-    "UserDataFolder": "",
-    # --- Other Technical ---
-    "ServerAllowCrossplay": "false",
-    "EACEnabled": "true",
-    "IgnoreEOSSanctions": "false",
-    "HideCommandExecutionLog": "0",
-    "MaxUncoveredMapChunksPerPlayer": "131072",
-    "PersistentPlayerProfiles": "false",
-    "MaxChunkAge": "-1",
-    "SaveDataLimit": "-1",
-    # --- World ---
-    "GameWorld": "Navezgane",
-    "WorldGenSeed": "MyGame",
-    "WorldGenSize": "6144",
-    "GameName": "MyGame",
-    "GameMode": "GameModeSurvival",
-    # --- Difficulty ---
-    "PlayerSafeZoneLevel": "5",
-    "PlayerSafeZoneHours": "5",
-    # --- Game Rules ---
-    "BuildCreate": "false",
-    "BedrollDeadZoneSize": "15",
-    "BedrollExpiryTime": "45",
-    "AllowSpawnNearFriend": "2",
-    "CameraRestrictionMode": "0",
-    # --- Performance ---
-    "MaxSpawnedZombies": "64",
-    "MaxSpawnedAnimals": "50",
-    "ServerMaxAllowedViewDistance": "12",
-    "MaxQueuedMeshLayers": "1000",
-    # --- Multiplayer ---
-    "PartySharedKillRange": "100",
-    "PlayerKillingMode": "3",
-    # --- Land Claims ---
-    "LandClaimCount": "5",
-    "LandClaimSize": "41",
-    "LandClaimDeadZone": "30",
-    "LandClaimExpiryTime": "7",
-    "LandClaimDecayMode": "0",
-    "LandClaimOnlineDurabilityModifier": "4",
-    "LandClaimOfflineDurabilityModifier": "4",
-    "LandClaimOfflineDelay": "0",
-    # --- Dynamic Mesh ---
-    "DynamicMeshEnabled": "true",
-    "DynamicMeshLandClaimOnly": "true",
-    "DynamicMeshLandClaimBuffer": "3",
-    "DynamicMeshMaxItemCache": "3",
-    # --- Twitch ---
-    "TwitchServerPermission": "90",
-    "TwitchBloodMoonAllowed": "false",
-    # --- Sandbox ---
-    "SandboxCode": "AAAJABJACJADJARFBNC",
-}
+def normalize_sandbox_code(raw: str) -> str:
+    """Clean a pasted Sandbox Code. Returns "" when the text is not code-like.
+
+    Accepts a bare code, a quoted code, or a whole pasted
+    ``<property name="SandboxCode" value="..."/>`` line.
+    """
+    if not raw:
+        return ""
+    text = raw.strip()
+    match = _SANDBOX_XML_VALUE.search(text)
+    if match:
+        text = match.group(1)
+    text = text.strip().strip("\"'")
+    text = re.sub(r"\s+", "", text)
+    return text if _SANDBOX_ALLOWED.fullmatch(text) else ""
+
+
+# Default value for every known property, derived from the schema (single source of truth).
+DEFAULT_CONFIG: Dict[str, str] = default_values()
 
 
 class ConfigManager:
@@ -115,38 +51,56 @@ class ConfigManager:
         self.settings: Dict[str, str] = {}
 
     def set_config_path(self, path: Path) -> None:
-        self.config_path = Path(path).resolve()
+        new_path = Path(path).resolve()
+        if new_path != self.config_path:
+            # Drop the tree parsed from the previous file.
+            self.tree = None
+            self.root = None
+            self.settings = {}
+        self.config_path = new_path
 
-    def load_config(self) -> Dict[str, str]:
-        """
-        Parses serverconfig.xml while preserving XML comments (Python 3.8+).
-        Returns a dictionary of key-value property settings.
+    def load_config_raw(self) -> Dict[str, str]:
+        """Parse the file and return exactly the properties it contains (no defaults added).
+
+        Comments are preserved in the in-memory tree (Python 3.8+) so a later save keeps them.
         """
         if not self.config_path or not self.config_path.exists():
-            self.settings = DEFAULT_CONFIG.copy()
-            return self.settings
+            self.tree = None
+            self.root = None
+            return {}
 
         try:
             parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
             self.tree = ET.parse(str(self.config_path), parser=parser)
             self.root = self.tree.getroot()
+        except Exception as err:
+            raise RuntimeError(f"Failed to parse {self.config_path.name}: {err}") from err
 
-            self.settings = {}
-            for elem in self.root.iter("property"):
-                name = elem.get("name")
-                value = elem.get("value")
-                if name is not None:
-                    self.settings[name] = value if value is not None else ""
+        values: Dict[str, str] = {}
+        for elem in self.root.iter("property"):
+            name = elem.get("name")
+            value = elem.get("value")
+            if name is not None:
+                values[name] = value if value is not None else ""
+        return values
 
-            # Ensure all default keys exist
-            for key, val in DEFAULT_CONFIG.items():
-                if key not in self.settings:
-                    self.settings[key] = val
-
+    def load_config(self) -> Dict[str, str]:
+        """
+        Parses serverconfig.xml while preserving XML comments (Python 3.8+).
+        Returns a dictionary of key-value property settings, with defaults for any missing keys.
+        """
+        if not self.config_path or not self.config_path.exists():
+            self.tree = None
+            self.root = None
+            self.settings = DEFAULT_CONFIG.copy()
             return self.settings
 
-        except Exception as err:
-            raise RuntimeError(f"Failed to parse serverconfig.xml: {err}") from err
+        self.settings = self.load_config_raw()
+        # Ensure all default keys exist
+        for key, val in DEFAULT_CONFIG.items():
+            if key not in self.settings:
+                self.settings[key] = val
+        return self.settings
 
     def create_backup(self) -> Optional[Path]:
         """
@@ -156,8 +110,9 @@ class ConfigManager:
             return None
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = self.config_path.parent / f"serverconfig_{timestamp}.xml.bak"
-        latest_bak = self.config_path.parent / "serverconfig.xml.bak"
+        stem = self.config_path.name[: -len(".xml")] if self.config_path.name.endswith(".xml") else self.config_path.name
+        backup_path = self.config_path.parent / f"{stem}_{timestamp}.xml.bak"
+        latest_bak = self.config_path.parent / f"{self.config_path.name}.bak"
 
         try:
             shutil.copy2(self.config_path, backup_path)
@@ -177,6 +132,10 @@ class ConfigManager:
 
         if make_backup and self.config_path.exists():
             self.create_backup()
+
+        # Never replace an existing file with only the keys being changed.
+        if self.root is None and self.config_path.exists():
+            self.load_config_raw()
 
         self.settings.update(new_settings)
 
@@ -221,9 +180,18 @@ class ConfigManager:
             if temp_path and temp_path.exists():
                 temp_path.unlink(missing_ok=True)
 
-    def reset_to_defaults(self, make_backup: bool = True) -> bool:
-        """Restores configuration to default settings."""
-        return self.save_config(DEFAULT_CONFIG, make_backup=make_backup)
+    def reset_to_defaults(self, make_backup: bool = True, keep: Optional[Dict[str, str]] = None) -> bool:
+        """Restores configuration to default settings.
+
+        ``keep`` values (e.g. Auger-managed file locations) override the defaults so a
+        reset never moves the server's saves.
+        """
+        values = dict(DEFAULT_CONFIG)
+        values.update(keep or {})
+        existing = self.load_config_raw() if self.config_path and self.config_path.exists() else {}
+        # Don't add empty properties the file never had (e.g. a commented-out UserDataFolder).
+        values = {k: v for k, v in values.items() if str(v).strip() or k in existing}
+        return self.save_config(values, make_backup=make_backup)
 
     def generate_default_file(self, target_path: Path) -> bool:
         """
@@ -233,77 +201,15 @@ class ConfigManager:
         self.root = ET.Element("ServerSettings")
         self.tree = ET.ElementTree(self.root)
 
-        sections: List[Tuple[str, List[str]]] = [
-            ("Server Representation", [
-                "ServerName", "ServerDescription", "ServerWebsiteURL",
-                "ServerPassword", "ServerLoginConfirmationText", "Region", "Language",
-            ]),
-            ("Networking", [
-                "ServerPort", "ServerVisibility", "ServerDisabledNetworkProtocols",
-                "ServerMaxWorldTransferSpeedKiBs",
-            ]),
-            ("Slots", [
-                "ServerMaxPlayerCount", "ServerReservedSlots", "ServerReservedSlotsPermission",
-                "ServerAdminSlots", "ServerAdminSlotsPermission",
-            ]),
-            ("Web Dashboard", [
-                "WebDashboardEnabled", "WebDashboardPort", "WebDashboardUrl", "EnableMapRendering",
-            ]),
-            ("Telnet", [
-                "TelnetEnabled", "TelnetPort", "TelnetPassword",
-                "TelnetFailedLoginLimit", "TelnetFailedLoginsBlocktime",
-            ]),
-            ("Terminal", ["TerminalWindowEnabled"]),
-            ("File Locations", ["AdminFileName", "UserDataFolder"]),
-            ("Other Technical", [
-                "ServerAllowCrossplay", "EACEnabled", "IgnoreEOSSanctions",
-                "HideCommandExecutionLog", "MaxUncoveredMapChunksPerPlayer",
-                "PersistentPlayerProfiles", "MaxChunkAge", "SaveDataLimit",
-            ]),
-            ("World", ["GameWorld", "WorldGenSeed", "WorldGenSize", "GameName", "GameMode"]),
-            ("Difficulty", ["PlayerSafeZoneLevel", "PlayerSafeZoneHours"]),
-            ("Game Rules", [
-                "BuildCreate", "BedrollDeadZoneSize", "BedrollExpiryTime",
-                "AllowSpawnNearFriend", "CameraRestrictionMode",
-            ]),
-            ("Performance", [
-                "MaxSpawnedZombies", "MaxSpawnedAnimals",
-                "ServerMaxAllowedViewDistance", "MaxQueuedMeshLayers",
-            ]),
-            ("Multiplayer", ["PartySharedKillRange", "PlayerKillingMode"]),
-            ("Land Claims", [
-                "LandClaimCount", "LandClaimSize", "LandClaimDeadZone",
-                "LandClaimExpiryTime", "LandClaimDecayMode",
-                "LandClaimOnlineDurabilityModifier", "LandClaimOfflineDurabilityModifier",
-                "LandClaimOfflineDelay",
-            ]),
-            ("Dynamic Mesh", [
-                "DynamicMeshEnabled", "DynamicMeshLandClaimOnly",
-                "DynamicMeshLandClaimBuffer", "DynamicMeshMaxItemCache",
-            ]),
-            ("Twitch", ["TwitchServerPermission", "TwitchBloodMoonAllowed"]),
-            ("Sandbox", ["SandboxCode"]),
-        ]
-
-        for section_title, keys in sections:
-            comment = ET.Comment(f" {section_title} ")
+        for group in GROUPS:
+            comment = ET.Comment(f" {group.title} ")
             self.root.append(comment)
-            for key in keys:
+            for key in group.keys:
+                if key == "UserDataFolder" and not DEFAULT_CONFIG.get(key):
+                    continue  # the game treats this as "unset" only when the property is absent
                 prop = ET.SubElement(self.root, "property")
                 prop.set("name", key)
                 prop.set("value", DEFAULT_CONFIG.get(key, ""))
 
-        return self.save_config(DEFAULT_CONFIG, make_backup=False)
-
-    def ensure_server_folder_layout(self, server_dir: Path, make_backup: bool = False) -> Dict[str, str]:
-        """
-        Configure serverconfig.xml so serveradmin.xml lives beside serverconfig.xml.
-        Sets UserDataFolder to the server install directory and AdminFileName to serveradmin.xml.
-        """
-        server_dir = server_dir.resolve()
-        updates = {
-            "AdminFileName": "serveradmin.xml",
-            "UserDataFolder": str(server_dir),
-        }
-        self.save_config(updates, make_backup=make_backup)
-        return updates
+        defaults = {k: v for k, v in DEFAULT_CONFIG.items() if k != "UserDataFolder" or v}
+        return self.save_config(defaults, make_backup=False)

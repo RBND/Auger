@@ -1,12 +1,20 @@
 """
-Asynchronous installer and updater for SteamCMD and 7 Days to Die Dedicated Server.
-Pipes process logs safely into a thread-safe queue.Queue for GUI updates.
+Asynchronous installer and updater for the download tool (SteamCMD / DepotDownloader)
+and the 7 Days to Die Dedicated Server.
+
+All results are delivered through the thread-safe ``queue.Queue`` used by the GUI:
+
+* ``("log", level, message)``
+* ``("status", component, message)``      component: "tool" | "server"
+* ``("progress", component, percent)``     percent: 0-100, or None to hide
+* ``("busy", bool)``
+* ``("callback", fn, args)``               run ``fn(*args)`` on the GUI thread
 """
 
 import os
 import platform
 import queue
-import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -14,9 +22,26 @@ import threading
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Dict, Optional, Union
 
-from .utils import get_app_dir, get_executable_name
+from .downloaders import (
+    GAME_APP_ID,
+    TOOL_STEAMCMD,
+    InstallOutputTracker,
+    build_install_command,
+    tool_binary_name,
+    tool_default_subdir,
+    tool_display_name,
+    tool_download_url,
+    tool_environment,
+    validate_beta_password,
+    validate_branch,
+)
+from .utils import ensure_executable, get_data_dir
+
+# Files the game depot ships that users customise. They are preserved across updates.
+PRESERVED_SERVER_FILES = ("serverconfig.xml",)
+PRESERVE_SUFFIX = ".auger-preserve"
 
 
 def _enqueue_output(
@@ -82,22 +107,42 @@ def _enqueue_output(
         line_queue.put(None)  # Sentinel: signals the reader is done
 
 
+def preserve_user_files(server_dir: Path) -> Dict[Path, Path]:
+    """Copy user-edited depot files aside before an update. Returns {original: backup}."""
+    preserved: Dict[Path, Path] = {}
+    for name in PRESERVED_SERVER_FILES:
+        original = server_dir / name
+        if original.is_file():
+            backup = server_dir / f"{name}{PRESERVE_SUFFIX}"
+            shutil.copy2(original, backup)
+            preserved[original] = backup
+    return preserved
+
+
+def restore_user_files(preserved: Dict[Path, Path]) -> None:
+    """Put preserved files back after an update (the depot may have overwritten them)."""
+    for original, backup in preserved.items():
+        if backup.is_file():
+            os.replace(backup, original)
+
+
 class InstallationManager:
     """
-    Manages SteamCMD download/extraction and 7DTD server downloading/updating
+    Manages download-tool setup and 7DTD server downloading/updating
     using background threads to ensure zero GUI lockups.
     """
 
-    STEAMCMD_WIN_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
-    STEAMCMD_LINUX_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
-    GAME_APP_ID = "294420"
+    GAME_APP_ID = GAME_APP_ID
     DOWNLOAD_TIMEOUT_SECONDS = 60
-    BRANCH_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
     def __init__(self, log_queue: queue.Queue):
         self.log_queue = log_queue
         self._is_running = False
+        self._lock = threading.Lock()
 
+    # ------------------------------------------------------------------
+    # Event helpers
+    # ------------------------------------------------------------------
     def log(self, message: str, level: str = "INFO") -> None:
         """Dispatches a log message tuple to the thread-safe GUI queue."""
         self.log_queue.put(("log", level, message))
@@ -106,37 +151,48 @@ class InstallationManager:
         """Dispatches a status change tuple to the thread-safe GUI queue."""
         self.log_queue.put(("status", component, message))
 
+    def progress(self, component: str, percent: Optional[float]) -> None:
+        self.log_queue.put(("progress", component, percent))
+
+    def _callback(self, fn: Optional[Callable], *args) -> None:
+        """Run ``fn`` on the GUI thread (Tkinter is not thread-safe)."""
+        if fn:
+            self.log_queue.put(("callback", fn, args))
+
     def is_busy(self) -> bool:
         return self._is_running
 
-    @classmethod
-    def build_app_update_argument(
-        cls,
-        branch: str = "public",
-        beta_password: Optional[str] = None,
-        validate: bool = True,
-    ) -> str:
-        """Build the single SteamCMD app_update argument safely.
+    def _try_begin(self) -> bool:
+        """Atomically claim the single operation slot (prevents double-clicks)."""
+        with self._lock:
+            if self._is_running:
+                return False
+            self._is_running = True
+        self.log_queue.put(("busy", True))
+        return True
 
-        SteamCMD retains the last selected beta branch.  Supplying ``public``
-        explicitly therefore also makes switching back to the stable server
-        reliable.
-        """
-        normalized_branch = branch.strip()
-        if not cls.BRANCH_PATTERN.fullmatch(normalized_branch):
-            raise ValueError(
-                "The server branch must be 1-64 letters, numbers, dots, underscores, or hyphens."
-            )
-        if beta_password and any(char in beta_password for char in "\r\n\x00"):
-            raise ValueError("The beta password contains unsupported characters.")
+    def _end(self) -> None:
+        with self._lock:
+            self._is_running = False
+        self.log_queue.put(("busy", False))
 
-        parts = [cls.GAME_APP_ID, "-beta", normalized_branch]
-        if beta_password:
-            parts.extend(["-betapassword", beta_password])
-        if validate:
-            parts.append("validate")
-        return " ".join(parts)
+    def _start_worker(self, target: Callable, *args) -> bool:
+        if not self._try_begin():
+            self.log("An operation is already in progress.", "WARNING")
+            return False
+        thread = threading.Thread(target=self._run_guarded, args=(target, *args), daemon=True)
+        thread.start()
+        return True
 
+    def _run_guarded(self, target: Callable, *args) -> None:
+        try:
+            target(*args)
+        finally:
+            self._end()
+
+    # ------------------------------------------------------------------
+    # Archive / download helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def _safe_archive_destination(destination: Path, member_name: str) -> Path:
         """Return a destination only when an archive member stays in its folder."""
@@ -173,7 +229,7 @@ class InstallationManager:
         report_progress: Callable[[int, int], None],
     ) -> None:
         """Download an HTTPS file with a timeout and progress reporting."""
-        request = urllib.request.Request(url, headers={"User-Agent": "Auger/1.1"})
+        request = urllib.request.Request(url, headers={"User-Agent": "Auger/1.2"})
         with urllib.request.urlopen(request, timeout=self.DOWNLOAD_TIMEOUT_SECONDS) as response:
             content_length = int(response.headers.get("Content-Length", "0"))
             downloaded = 0
@@ -183,14 +239,15 @@ class InstallationManager:
                     downloaded += len(chunk)
                     report_progress(downloaded, content_length)
 
-    def _run_steamcmd_hidden(
+    def _run_tool_hidden(
         self,
-        cmd: list[str],
+        cmd: list,
         cwd: str,
         line_callback: Callable[[str], None],
+        env: Optional[Dict[str, str]] = None,
     ) -> int:
         """
-        Launches a SteamCMD command with no console window.
+        Launches a download-tool command with no console window.
         Uses a dedicated reader thread to stream stdout lines to line_callback in real time.
         Returns the process exit code.
         """
@@ -200,10 +257,12 @@ class InstallationManager:
         proc = subprocess.Popen(
             cmd,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
             creationflags=creation_flags,
+            env=env,
         )
 
         # Spin up dedicated reader thread for this process's stdout
@@ -231,50 +290,39 @@ class InstallationManager:
         proc.wait()
         return proc.returncode
 
-    def download_and_setup_steamcmd_async(
+    # ------------------------------------------------------------------
+    # Download tool setup (SteamCMD or DepotDownloader)
+    # ------------------------------------------------------------------
+    def default_tool_dir(self, tool: str) -> Path:
+        return get_data_dir() / tool_default_subdir(tool)
+
+    def download_and_setup_tool_async(
         self,
+        tool: str,
         target_dir: Optional[Union[Path, str]] = None,
         on_complete: Optional[Callable[[Optional[Path]], None]] = None,
-    ) -> None:
-        """Starts background thread to download and bootstrap SteamCMD."""
-        if self._is_running:
-            self.log("An operation is already in progress.", "WARNING")
-            return
+    ) -> bool:
+        """Starts a background thread to download and prepare the download tool."""
+        return self._start_worker(self._setup_tool_worker, tool, target_dir, on_complete)
 
-        thread = threading.Thread(
-            target=self._download_and_setup_steamcmd_worker,
-            args=(target_dir, on_complete),
-            daemon=True,
-        )
-        thread.start()
-
-    def _download_and_setup_steamcmd_worker(
+    def _setup_tool_worker(
         self,
+        tool: str,
         target_dir: Optional[Union[Path, str]],
         on_complete: Optional[Callable[[Optional[Path]], None]],
     ) -> None:
-        self._is_running = True
-        is_windows = platform.system() == "Windows"
-        exe_name = get_executable_name("steamcmd")
-
+        name = tool_display_name(tool)
+        archive_path: Optional[Path] = None
         try:
-            dest_dir = (
-                Path(target_dir).resolve()
-                if target_dir
-                else (get_app_dir() / "steamcmd")
-            )
+            dest_dir = Path(target_dir).resolve() if target_dir else self.default_tool_dir(tool)
             dest_dir.mkdir(parents=True, exist_ok=True)
 
-            self.status_update("steamcmd", "Downloading...")
-            self.log(f"Downloading SteamCMD into {dest_dir}...", "INFO")
+            self.status_update("tool", "Downloading...")
+            self.log(f"Downloading {name} into {dest_dir}...", "INFO")
 
-            download_url = (
-                self.STEAMCMD_WIN_URL if is_windows else self.STEAMCMD_LINUX_URL
-            )
-            archive_suffix = ".zip" if is_windows else ".tar.gz"
-            with tempfile.NamedTemporaryFile(
-                dir=dest_dir, suffix=archive_suffix, delete=False
-            ) as handle:
+            url = tool_download_url(tool)
+            suffix = ".tar.gz" if url.endswith(".tar.gz") else ".zip"
+            with tempfile.NamedTemporaryFile(dir=dest_dir, suffix=suffix, delete=False) as handle:
                 archive_path = Path(handle.name)
 
             last_percent = -1
@@ -283,110 +331,110 @@ class InstallationManager:
                 nonlocal last_percent
                 if total_size > 0:
                     percent = int(min(100.0, (downloaded / total_size) * 100))
-                    if percent != last_percent and (percent % 5 == 0 or percent == 100):
+                    if percent != last_percent:
                         last_percent = percent
-                        self.log(f"Downloading: {percent}%", "INFO")
+                        self.progress("tool", percent)
+                        if percent % 10 == 0:
+                            self.log(f"Downloading: {percent}%", "INFO")
 
-            self._download_file(download_url, archive_path, _report_progress)
+            self._download_file(url, archive_path, _report_progress)
             self.log("Download completed. Extracting files...", "SUCCESS")
 
-            self.status_update("steamcmd", "Extracting...")
-            if is_windows or str(archive_path).endswith(".zip"):
+            self.status_update("tool", "Extracting...")
+            if suffix == ".zip":
                 self._extract_zip_safely(archive_path, dest_dir)
             else:
                 self._extract_tar_safely(archive_path, dest_dir)
 
-            if archive_path.exists():
-                archive_path.unlink()
+            tool_bin = dest_dir / tool_binary_name(tool)
+            if not tool_bin.is_file():
+                raise FileNotFoundError(f"{tool_bin.name} was not found after extraction.")
+            ensure_executable(tool_bin)
+            if tool == TOOL_STEAMCMD:
+                ensure_executable(dest_dir / "linux32" / "steamcmd")
 
-            steamcmd_bin = dest_dir / exe_name
-            if not is_windows and steamcmd_bin.exists():
-                steamcmd_bin.chmod(0o755)
+            self.log(f"{name} extracted to {tool_bin}", "SUCCESS")
+            self.status_update("tool", "Checking...")
 
-            self.log(f"SteamCMD successfully extracted to {steamcmd_bin}", "SUCCESS")
-
-            # Bootstrapping First-Run Step
-            self.log("Performing SteamCMD initial self-update / bootstrap...", "INFO")
-            self.status_update("steamcmd", "Bootstrapping...")
-
-            def _on_bootstrap_line(line: str):
+            def _on_line(line: str) -> None:
                 if line:
                     self.log(line, "INFO")
 
-            self._run_steamcmd_hidden(
-                cmd=[str(steamcmd_bin), "+quit"],
-                cwd=str(dest_dir),
-                line_callback=_on_bootstrap_line,
-            )
+            if tool == TOOL_STEAMCMD:
+                # First run: SteamCMD updates itself.
+                self.log("Performing SteamCMD initial self-update...", "INFO")
+                self._run_tool_hidden([str(tool_bin), "+quit"], str(dest_dir), _on_line)
+            else:
+                # Sanity check: confirms the binary runs on this system.
+                env = tool_environment(tool, os.environ.copy())
+                code = self._run_tool_hidden([str(tool_bin), "-V"], str(dest_dir), _on_line, env)
+                if code != 0:
+                    raise RuntimeError(f"{name} could not run on this system (exit code {code}).")
 
-            self.log("SteamCMD initial setup completed successfully!", "SUCCESS")
-            self.status_update("steamcmd", "Ready")
-
-            if on_complete:
-                on_complete(steamcmd_bin)
+            self.log(f"{name} is ready.", "SUCCESS")
+            self.status_update("tool", "Ready")
+            self._callback(on_complete, tool_bin)
 
         except Exception as err:
-            self.log(f"SteamCMD installation failed: {err}", "ERROR")
-            self.status_update("steamcmd", "Error")
-            if on_complete:
-                on_complete(None)
-
+            self.log(f"{name} installation failed: {err}", "ERROR")
+            self.status_update("tool", "Error")
+            self._callback(on_complete, None)
         finally:
-            self._is_running = False
+            self.progress("tool", None)
+            if archive_path and archive_path.exists():
+                archive_path.unlink(missing_ok=True)
 
+    # ------------------------------------------------------------------
+    # Server install / update
+    # ------------------------------------------------------------------
     def install_or_update_server_async(
         self,
-        steamcmd_path: Path,
+        tool: str,
+        tool_path: Path,
         server_dir: Path,
         branch: str = "public",
         beta_password: Optional[str] = None,
-        validate: bool = True,
+        validate: bool = False,
         on_complete: Optional[Callable[[bool], None]] = None,
-    ) -> None:
-        """Starts background thread to download or update the 7DTD Dedicated Server."""
-        if self._is_running:
-            self.log("An operation is already in progress.", "WARNING")
-            return
-
-        thread = threading.Thread(
-            target=self._install_or_update_server_worker,
-            args=(steamcmd_path, server_dir, branch, beta_password, validate, on_complete),
-            daemon=True,
+    ) -> bool:
+        """Starts a background thread to download or update the 7DTD Dedicated Server."""
+        try:
+            validate_branch(branch)
+            validate_beta_password(beta_password)
+        except ValueError as err:
+            self.log(str(err), "ERROR")
+            return False
+        return self._start_worker(
+            self._install_server_worker,
+            tool, tool_path, server_dir, branch, beta_password, validate, on_complete,
         )
-        thread.start()
 
-    def _install_or_update_server_worker(
+    def _install_server_worker(
         self,
-        steamcmd_path: Path,
+        tool: str,
+        tool_path: Path,
         server_dir: Path,
         branch: str,
         beta_password: Optional[str],
         validate: bool,
         on_complete: Optional[Callable[[bool], None]],
     ) -> None:
-        self._is_running = True
+        preserved: Dict[Path, Path] = {}
+        success = False
         try:
             server_dir.mkdir(parents=True, exist_ok=True)
+            preserved = preserve_user_files(server_dir)
+            if preserved:
+                self.log("Backed up your serverconfig.xml so the update cannot overwrite it.", "INFO")
+
             self.status_update("server", "Downloading / Updating...")
             self.log(
-                f"Starting 7DTD Server download/update from the '{branch}' branch in {server_dir}...",
+                f"Starting 7DTD Server download/update from the '{branch}' branch "
+                f"using {tool_display_name(tool)} into {server_dir}...",
                 "INFO",
             )
-            app_update_argument = self.build_app_update_argument(
-                branch=branch, beta_password=beta_password, validate=validate
-            )
 
-            cmd = [
-                str(steamcmd_path),
-                "+login",
-                "anonymous",
-                "+force_install_dir",
-                str(server_dir),
-                "+app_update",
-                app_update_argument,
-            ]
-            cmd.append("+quit")
-
+            cmd = build_install_command(tool, tool_path, server_dir, branch, beta_password, validate)
             # Do not log the raw command: a password for a private branch would be exposed.
             self.log(
                 f"Requesting app {self.GAME_APP_ID} branch '{branch}'"
@@ -394,41 +442,42 @@ class InstallationManager:
                 "INFO",
             )
 
-            def _on_server_line(clean_line: str):
-                if "Error" in clean_line or "FAILED" in clean_line:
-                    self.log(clean_line, "ERROR")
-                elif "Success" in clean_line or "Fully installed" in clean_line:
-                    self.log(clean_line, "SUCCESS")
-                else:
-                    self.log(clean_line, "INFO")
+            tracker = InstallOutputTracker(tool)
+            last_logged_percent = -1
 
-            return_code = self._run_steamcmd_hidden(
-                cmd=cmd,
-                cwd=str(steamcmd_path.parent),
-                line_callback=_on_server_line,
-            )
+            def _on_line(line: str) -> None:
+                nonlocal last_logged_percent
+                level = tracker.feed(line)
+                if level == "PROGRESS":
+                    pct = tracker.last_percent or 0.0
+                    self.progress("server", pct)
+                    if int(pct) != last_logged_percent:
+                        last_logged_percent = int(pct)
+                        self.log(f"Downloading: {int(pct)}%", "INFO")
+                    return
+                self.log(line, level)
 
-            if return_code == 0:
-                self.log(
-                    "7 Days to Die Dedicated Server installation/update completed!",
-                    "SUCCESS",
-                )
+            env = tool_environment(tool, os.environ.copy())
+            return_code = self._run_tool_hidden(cmd, str(tool_path.parent), _on_line, env)
+            success = tracker.succeeded(return_code)
+
+            if success:
+                self.log("7 Days to Die Dedicated Server installation/update completed!", "SUCCESS")
                 self.status_update("server", "Installed & Ready")
-                if on_complete:
-                    on_complete(True)
             else:
-                self.log(
-                    f"SteamCMD exited with non-zero code ({return_code}). Update may be incomplete.",
-                    "WARNING",
-                )
-                self.status_update("server", "Update Warning")
-                if on_complete:
-                    on_complete(False)
+                details = tracker.errors[-1] if tracker.errors else f"exit code {return_code}"
+                self.log(f"The server download did not finish successfully ({details}).", "ERROR")
+                self.status_update("server", "Update Failed")
 
         except Exception as err:
             self.log(f"Failed during server update: {err}", "ERROR")
             self.status_update("server", "Error")
-            if on_complete:
-                on_complete(False)
         finally:
-            self._is_running = False
+            try:
+                restore_user_files(preserved)
+                if preserved:
+                    self.log("Restored your serverconfig.xml.", "INFO")
+            except OSError as err:
+                self.log(f"Could not restore serverconfig.xml backup: {err}", "ERROR")
+            self.progress("server", None)
+            self._callback(on_complete, success)

@@ -25,71 +25,43 @@ check_tkinter() {
     return 1
 }
 
-# Function to install missing dependencies (Python3, Tkinter, and SteamCMD 32-bit runtime libs)
+# Function to install missing dependencies (Python 3 + Tkinter).
+# Server files are downloaded with DepotDownloader (64-bit), so SteamCMD's
+# 32-bit compatibility libraries are NOT required on Linux.
 install_dependencies() {
     echo "=========================================================="
-    echo "  Checking & Installing Required Dependencies for Auger"
+    echo "  Installing Python 3 + Tkinter (needed to run Auger)"
     echo "=========================================================="
-
-    IS_64BIT=false
-    if [ "$(uname -m)" = "x86_64" ]; then
-        IS_64BIT=true
-    fi
 
     # Debian / Ubuntu / Mint / Pop!_OS
     if command -v apt-get &> /dev/null; then
         echo "Detected Debian/Ubuntu-based package manager (apt)."
         sudo apt-get update
-        PKGS="python3 python3-tk"
-        if [ "$IS_64BIT" = true ]; then
-            # lib32gcc-s1 (Ubuntu 20.04+) or lib32gcc1 (older)
-            if apt-cache show lib32gcc-s1 &> /dev/null; then
-                PKGS="$PKGS lib32gcc-s1"
-            else
-                PKGS="$PKGS lib32gcc1"
-            fi
-        fi
-        sudo apt-get install -y $PKGS
+        sudo apt-get install -y python3 python3-tk
 
     # Fedora / RHEL 8+
     elif command -v dnf &> /dev/null; then
         echo "Detected Fedora/RHEL-based package manager (dnf)."
-        PKGS="python3 python3-tkinter"
-        if [ "$IS_64BIT" = true ]; then
-            PKGS="$PKGS glibc.i686 libstdc++.i686"
-        fi
-        sudo dnf install -y $PKGS
+        sudo dnf install -y python3 python3-tkinter
 
     # CentOS / older RHEL
     elif command -v yum &> /dev/null; then
         echo "Detected CentOS/RHEL package manager (yum)."
-        PKGS="python3 python3-tkinter"
-        if [ "$IS_64BIT" = true ]; then
-            PKGS="$PKGS glibc.i686 libstdc++.i686"
-        fi
-        sudo yum install -y $PKGS
+        sudo yum install -y python3 python3-tkinter
 
     # Arch Linux / Manjaro / EndeavourOS
     elif command -v pacman &> /dev/null; then
         echo "Detected Arch-based package manager (pacman)."
-        PKGS="python tk"
-        if [ "$IS_64BIT" = true ]; then
-            PKGS="$PKGS lib32-gcc-libs"
-        fi
-        sudo pacman -Syu --needed --noconfirm $PKGS
+        sudo pacman -S --needed --noconfirm python tk
 
     # openSUSE / SLES
     elif command -v zypper &> /dev/null; then
         echo "Detected openSUSE package manager (zypper)."
-        PKGS="python3 python3-tk"
-        if [ "$IS_64BIT" = true ]; then
-            PKGS="$PKGS libgcc_s1-32bit"
-        fi
-        sudo zypper install -y $PKGS
+        sudo zypper install -y python3 python3-tk
 
     else
         echo "[!] Could not automatically detect system package manager."
-        echo "    Please manually install: Python 3, Tkinter, and 32-bit runtime libraries (for SteamCMD)."
+        echo "    Please manually install: Python 3 and Tkinter."
         read -p "Press Enter to continue..."
         return 1
     fi

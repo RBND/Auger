@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .utils import game_default_userdata_dir
+
 DEFAULT_ADMIN_FILENAME = "serveradmin.xml"
 
 ADMIN_XML_HEADER = """<!--
@@ -156,7 +158,11 @@ def _xml_attr(value: str) -> str:
 
 def resolve_admin_file_path(server_dir: Path, settings: Optional[Dict[str, str]] = None) -> Path:
     """
-    Resolve serveradmin.xml beside serverconfig.xml when UserDataFolder is the server dir.
+    Return the serveradmin.xml the game actually reads.
+
+    Per the game's own serverconfig.xml: "AdminFileName ... Path relative to
+    UserDataFolder/Saves". When UserDataFolder is not set the game uses its default
+    user-data folder (%APPDATA%\\7DaysToDie on Windows, ~/.local/share/7DaysToDie on Linux).
     """
     settings = settings or {}
     admin_filename = settings.get("AdminFileName", DEFAULT_ADMIN_FILENAME).strip() or DEFAULT_ADMIN_FILENAME
@@ -165,21 +171,30 @@ def resolve_admin_file_path(server_dir: Path, settings: Optional[Dict[str, str]]
     if admin_path.is_absolute():
         return admin_path
 
-    server_dir = server_dir.resolve()
     userdata = settings.get("UserDataFolder", "").strip()
+    base = Path(userdata) if userdata else game_default_userdata_dir()
+    return base / "Saves" / admin_filename
 
-    if userdata and Path(userdata).resolve() == server_dir:
-        return server_dir / admin_filename
 
-    if userdata:
-        return Path(userdata) / "Saves" / admin_filename
+def legacy_admin_file_path(server_dir: Path, settings: Optional[Dict[str, str]] = None) -> Path:
+    """Where earlier Auger versions wrongly wrote serveradmin.xml (the game never read it)."""
+    settings = settings or {}
+    admin_filename = settings.get("AdminFileName", DEFAULT_ADMIN_FILENAME).strip() or DEFAULT_ADMIN_FILENAME
+    return Path(server_dir) / Path(admin_filename).name
 
-    for candidate_dir in (server_dir, server_dir / "Saves"):
-        candidate = candidate_dir / admin_filename
-        if candidate.exists():
-            return candidate
 
-    return server_dir / admin_filename
+def migrate_legacy_admin_file(server_dir: Path, settings: Optional[Dict[str, str]] = None) -> Optional[Path]:
+    """Copy a legacy serveradmin.xml to the real location if the real one doesn't exist yet.
+
+    Returns the new path when a migration happened.
+    """
+    legacy = legacy_admin_file_path(server_dir, settings)
+    target = resolve_admin_file_path(server_dir, settings)
+    if legacy.resolve() == target.resolve() or target.exists() or not legacy.is_file():
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(legacy, target)
+    return target
 
 
 class AdminManager:

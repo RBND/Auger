@@ -1,26 +1,30 @@
 """
-Main Tkinter application window, layout, tabs, state management, and thread event loop integration.
+Main Tkinter application window: layout, tabs, and wiring to AugerService.
+
+This module is a *view*: it builds widgets, forwards user actions to
+``core.service.AugerService`` and renders the events the service emits.
+All file, download and process logic lives in the service.
 """
 
 import queue
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from core.admin_manager import AdminManager, resolve_admin_file_path
-from core.config_manager import ConfigManager
-from core.detector import find_7dtd_server, find_steamcmd
-from core.installer import InstallationManager
-from core.utils import (
-    get_app_dir,
-    get_executable_name,
-    launch_batch_in_new_window,
-    launch_detached_process,
-    open_folder,
+from core import __version__
+from core.config_schema import CHOICE, FIELDS_BY_KEY, GROUPS
+from core.service import AugerService, ServiceError, normalize_sandbox_code
+from core.settings_store import get_saved_value
+from core.utils import open_folder, server_binary_name
+from gui.views import (
+    UI_FONT,
+    LoggerTextBox,
+    SandboxCodeHelpDialog,
+    SteamCMDMissingModal,
+    bind_mousewheel,
+    disable_combobox_wheel,
 )
-from core.settings_store import get_saved_path, get_saved_value, save_settings
-from gui.views import LoggerTextBox, SteamCMDMissingModal
 
 PLATFORM_OPTIONS = ["Steam", "EOS", "XBL", "PSN"]
 SERVER_BRANCH_STABLE = "Stable (public)"
@@ -35,189 +39,6 @@ SERVER_BRANCH_VALUES = {
     SERVER_BRANCH_STABLE: "public",
     SERVER_BRANCH_EXPERIMENTAL: "latest_experimental",
 }
-# Dropdown options for config fields with a small discrete set of choices
-# ---------------------------------------------------------------------------
-DROPDOWN_OPTIONS: Dict[str, List[str]] = {
-    "Region": [
-        "NorthAmericaEast", "NorthAmericaWest", "CentralAmerica", "SouthAmerica",
-        "Europe", "Russia", "Asia", "MiddleEast", "Africa", "Oceania",
-    ],
-    "ServerVisibility": ["2", "1", "0"],
-    "ServerDisabledNetworkProtocols": [
-        "",
-        "LiteNetLib",
-        "SteamNetworking",
-        "LiteNetLib,SteamNetworking",
-    ],
-    "WebDashboardEnabled": ["false", "true"],
-    "EnableMapRendering": ["false", "true"],
-    "TelnetEnabled": ["true", "false"],
-    "TerminalWindowEnabled": ["true", "false"],
-    "ServerAllowCrossplay": ["false", "true"],
-    "EACEnabled": ["true", "false"],
-    "IgnoreEOSSanctions": ["false", "true"],
-    "HideCommandExecutionLog": ["0", "1", "2", "3"],
-    "PersistentPlayerProfiles": ["false", "true"],
-    #"GameWorld": ["Navezgane", "Pregen06k01", "Pregen06k02", "Pregen08k01", "Pregen08k02", "RWG"], 
-    # #Removed to allow for custom worlds.
-    "WorldGenSize": ["6144", "8192", "10240"],
-    "GameMode": ["GameModeSurvival"],
-    "BuildCreate": ["false", "true"],
-    "AllowSpawnNearFriend": ["2", "1", "0"],
-    "CameraRestrictionMode": ["0", "1", "2"],
-    "ServerMaxAllowedViewDistance": ["6", "7", "8", "9", "10", "11", "12"],
-    "PlayerKillingMode": ["3", "2", "1", "0"],
-    "LandClaimDecayMode": ["0", "1", "2"],
-    "DynamicMeshEnabled": ["true", "false"],
-    "DynamicMeshLandClaimOnly": ["true", "false"],
-    "TwitchBloodMoonAllowed": ["false", "true"],
-}
-
-# Human-readable labels and tooltips for every config property
-# Each entry: (display_label, tooltip_text)
-FIELD_META: Dict[str, Tuple[str, str]] = {
-    # Server Representation
-    "ServerName": ("Server Name:", "Name displayed in the server browser"),
-    "ServerDescription": ("Description:", "Short description shown in the server browser"),
-    "ServerWebsiteURL": ("Website URL:", "Optional website/Discord link shown in browser"),
-    "ServerPassword": ("Password:", "Leave empty for no password"),
-    "ServerLoginConfirmationText": ("Join Confirmation:", "Message player must confirm on join (leave empty to skip)"),
-    "Region": ("Region:", "Geographic region for matchmaking"),
-    "Language": ("Language:", "Primary language for players (English name, e.g. German)"),
-    # Networking
-    "ServerPort": ("Server Port:", "Default: 26900 — keep in range 26900-26905 or 27015-27020 for LAN"),
-    "ServerVisibility": ("Visibility:", "2 = Public, 1 = Friends Only, 0 = Not Listed"),
-    "ServerDisabledNetworkProtocols": ("Disabled Protocols:", "Comma-separated: LiteNetLib, SteamNetworking"),
-    "ServerMaxWorldTransferSpeedKiBs": ("Max World Transfer (KiB/s):", "Max speed to transfer world to new clients (max ~1300)"),
-    # Slots
-    "ServerMaxPlayerCount": ("Max Players:", "Maximum concurrent player slots"),
-    "ServerReservedSlots": ("Reserved Slots:", "Slots reserved for privileged players"),
-    "ServerReservedSlotsPermission": ("Reserved Slots Permission:", "Permission level required to use reserved slots"),
-    "ServerAdminSlots": ("Admin Slots:", "Admin slots above the player limit"),
-    "ServerAdminSlotsPermission": ("Admin Slots Permission:", "Permission level required for admin slots"),
-    # Web Dashboard
-    "WebDashboardEnabled": ("Web Dashboard:", "Enable/disable the web dashboard"),
-    "WebDashboardPort": ("Dashboard Port:", "Default: 8080"),
-    "WebDashboardUrl": ("Dashboard URL:", "External URL if behind a reverse proxy (full URL required)"),
-    "EnableMapRendering": ("Map Rendering:", "Render map tiles for the web dashboard"),
-    # Telnet
-    "TelnetEnabled": ("Telnet Enabled:", "Enable/disable the Telnet remote console"),
-    "TelnetPort": ("Telnet Port:", "Default: 8081"),
-    "TelnetPassword": ("Telnet Password:", "Empty = loopback only; set password to allow remote access"),
-    "TelnetFailedLoginLimit": ("Telnet Login Limit:", "Wrong password attempts before IP block"),
-    "TelnetFailedLoginsBlocktime": ("Telnet Block Time (s):", "How long an IP stays blocked after failed logins"),
-    # Terminal
-    "TerminalWindowEnabled": ("Terminal Window:", "Show a console window for log/command input (Windows only)"),
-    # File Locations
-    "AdminFileName": ("Admin File Name:", "Filename for serveradmin.xml (default: serveradmin.xml)"),
-    "UserDataFolder": ("User Data Folder:", "Absolute path to server user data (auto-set to server install folder)"),
-    # Other Technical
-    "ServerAllowCrossplay": ("Allow Crossplay:", "Enable cross-platform play (may restrict some features)"),
-    "EACEnabled": ("EAC Enabled:", "Enable/disable Easy Anti-Cheat"),
-    "IgnoreEOSSanctions": ("Ignore EOS Sanctions:", "Allow sanctioned players to join"),
-    "HideCommandExecutionLog": ("Hide Command Log:", "0=Show all, 1=Hide Telnet, 2=Hide remote, 3=Hide all"),
-    "MaxUncoveredMapChunksPerPlayer": ("Max Map Chunks/Player:", "Max chunks uncovered per player (default 131072 ≈ 32 km²)"),
-    "PersistentPlayerProfiles": ("Persistent Profiles:", "Players must use the same profile they last joined with"),
-    "MaxChunkAge": ("Max Chunk Age:", "In-game days before unvisited chunk resets (-1 = disabled)"),
-    "SaveDataLimit": ("Save Data Limit (MB):", "Max disk space per saved game in MB (-1 = unlimited)"),
-    # World
-    "GameWorld": ("Game World:", "Navezgane, Pregen maps, or RWG for random generation"),
-    "WorldGenSeed": ("World Seed:", "Seed string for RWG world generation"),
-    "WorldGenSize": ("World Size:", "RWG size: 6144, 8192, or 10240"),
-    "GameName": ("Save Game Name:", "Unique name for this save (alphanumeric + _-. )"),
-    "GameMode": ("Game Mode:", "GameModeSurvival"),
-    # Difficulty
-    "PlayerSafeZoneLevel": ("Safe Zone Max Level:", "Players at or below this level get a spawn safe zone"),
-    "PlayerSafeZoneHours": ("Safe Zone Hours:", "World-time hours the spawn safe zone lasts"),
-    # Game Rules
-    "BuildCreate": ("Cheat Mode:", "Enable build/create cheat mode (god mode building)"),
-    "BedrollDeadZoneSize": ("Bedroll Dead Zone:", "Radius (blocks) around bedroll where zombies won't spawn"),
-    "BedrollExpiryTime": ("Bedroll Expiry (days):", "Real-world days before bedroll expires after owner goes offline"),
-    "AllowSpawnNearFriend": ("Spawn Near Friend:", "0=Off, 1=Always, 2=Friends in forest only"),
-    "CameraRestrictionMode": ("Camera Mode:", "0=Free, 1=First person only, 2=Third person only"),
-    # Performance
-    "MaxSpawnedZombies": ("Max Zombies:", "Global zombie cap — high values impact performance heavily"),
-    "MaxSpawnedAnimals": ("Max Animals:", "Global animal cap — lower impact than zombies"),
-    "ServerMaxAllowedViewDistance": ("Max View Distance:", "Max client view distance in chunks (6–12)"),
-    "MaxQueuedMeshLayers": ("Max Queued Mesh Layers:", "Concurrent chunk mesh layers — lower = less RAM, slower generation"),
-    # Multiplayer
-    "PartySharedKillRange": ("Party Kill Share Range:", "Distance (m) to receive shared kill XP in party"),
-    "PlayerKillingMode": ("PvP Mode:", "0=No PvP, 1=Allies, 2=Strangers, 3=Everyone"),
-    # Land Claims
-    "LandClaimCount": ("Land Claims Per Player:", "Max land claims allowed per player"),
-    "LandClaimSize": ("Claim Size:", "Box radius of the protected keystone area (blocks)"),
-    "LandClaimDeadZone": ("Claim Dead Zone:", "Minimum distance between keystones (blocks)"),
-    "LandClaimExpiryTime": ("Claim Expiry (days):", "Real-world offline days before claims expire"),
-    "LandClaimDecayMode": ("Claim Decay Mode:", "0=Slow/Linear, 1=Fast/Exponential, 2=None (full protection)"),
-    "LandClaimOnlineDurabilityModifier": ("Online Hardness Modifier:", "Block hardness multiplier when owner is online (0=infinite)"),
-    "LandClaimOfflineDurabilityModifier": ("Offline Hardness Modifier:", "Block hardness multiplier when owner is offline (0=infinite)"),
-    "LandClaimOfflineDelay": ("Offline Delay (min):", "Minutes after logout before hardness transitions to offline value"),
-    # Dynamic Mesh
-    "DynamicMeshEnabled": ("Dynamic Mesh:", "Enable the dynamic mesh system for detailed geometry"),
-    "DynamicMeshLandClaimOnly": ("Mesh in LCB Only:", "Restrict dynamic mesh to land claim areas"),
-    "DynamicMeshLandClaimBuffer": ("Mesh LCB Radius:", "Chunk radius around LCB to apply dynamic mesh"),
-    "DynamicMeshMaxItemCache": ("Mesh Item Cache:", "Concurrent mesh items processed (higher = more RAM)"),
-    # Twitch
-    "TwitchServerPermission": ("Twitch Permission Level:", "Permission level required to use Twitch integration"),
-    "TwitchBloodMoonAllowed": ("Twitch Blood Moon:", "Allow Twitch actions during blood moon (may cause lag)"),
-    # Sandbox
-    "SandboxCode": ("Sandbox Code:", "Difficulty/sandbox options code — use in-game copy button to generate"),
-}
-
-# Ordered group definitions for the config editor tab
-CONFIG_GROUPS: List[Tuple[str, List[str]]] = [
-    ("🏷️ Server Representation", [
-        "ServerName", "ServerDescription", "ServerWebsiteURL",
-        "ServerPassword", "ServerLoginConfirmationText", "Region", "Language",
-    ]),
-    ("🌐 Networking", [
-        "ServerPort", "ServerVisibility",
-        "ServerDisabledNetworkProtocols", "ServerMaxWorldTransferSpeedKiBs",
-    ]),
-    ("👥 Slots", [
-        "ServerMaxPlayerCount", "ServerReservedSlots", "ServerReservedSlotsPermission",
-        "ServerAdminSlots", "ServerAdminSlotsPermission",
-    ]),
-    ("📊 Web Dashboard", [
-        "WebDashboardEnabled", "WebDashboardPort", "WebDashboardUrl", "EnableMapRendering",
-    ]),
-    ("💻 Telnet Console", [
-        "TelnetEnabled", "TelnetPort", "TelnetPassword",
-        "TelnetFailedLoginLimit", "TelnetFailedLoginsBlocktime",
-    ]),
-    ("🪟 Terminal Window", ["TerminalWindowEnabled"]),
-    ("📁 File Locations", ["AdminFileName", "UserDataFolder"]),
-    ("⚙️ Other Technical Settings", [
-        "ServerAllowCrossplay", "EACEnabled", "IgnoreEOSSanctions",
-        "HideCommandExecutionLog", "MaxUncoveredMapChunksPerPlayer",
-        "PersistentPlayerProfiles", "MaxChunkAge", "SaveDataLimit",
-    ]),
-    ("🌍 World", [
-        "GameWorld", "WorldGenSeed", "WorldGenSize", "GameName", "GameMode",
-    ]),
-    ("⚠️ Difficulty", ["PlayerSafeZoneLevel", "PlayerSafeZoneHours"]),
-    ("📜 Game Rules", [
-        "BuildCreate", "BedrollDeadZoneSize", "BedrollExpiryTime",
-        "AllowSpawnNearFriend", "CameraRestrictionMode",
-    ]),
-    ("🖥️ Performance", [
-        "MaxSpawnedZombies", "MaxSpawnedAnimals",
-        "ServerMaxAllowedViewDistance", "MaxQueuedMeshLayers",
-    ]),
-    ("🤝 Multiplayer", ["PartySharedKillRange", "PlayerKillingMode"]),
-    ("🏠 Land Claims", [
-        "LandClaimCount", "LandClaimSize", "LandClaimDeadZone",
-        "LandClaimExpiryTime", "LandClaimDecayMode",
-        "LandClaimOnlineDurabilityModifier", "LandClaimOfflineDurabilityModifier",
-        "LandClaimOfflineDelay",
-    ]),
-    ("🔷 Dynamic Mesh", [
-        "DynamicMeshEnabled", "DynamicMeshLandClaimOnly",
-        "DynamicMeshLandClaimBuffer", "DynamicMeshMaxItemCache",
-    ]),
-    ("📺 Twitch Integration", ["TwitchServerPermission", "TwitchBloodMoonAllowed"]),
-    ("🧩 Sandbox", ["SandboxCode"]),
-]
 
 ADMIN_PERMISSION_LEVELS = ["0 (Superadmin)", "10 (Admin)", "100 (Moderator)", "1000 (Player)"]
 ADMIN_PERMISSION_VALUES = ["0", "10", "100", "1000"]
@@ -251,6 +72,8 @@ ADMIN_COLUMN_META: Dict[str, str] = {
     "cmd": "Console command name (e.g. kick, ban, giveself)",
 }
 
+ADMIN_SECTIONS = ("users", "whitelist", "blacklist", "commands")
+
 
 def _perm_display(val: str) -> str:
     """Convert a raw permission level string to a display string."""
@@ -266,39 +89,36 @@ def _perm_raw(display: str) -> str:
 class MainWindow:
     """
     Main application UI class managing notebook tabs, path configuration,
-    server control buttons, XML configuration editor, and thread log events.
+    server control buttons, XML configuration editor, and service events.
     """
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, service: Optional[AugerService] = None):
         self.root = root
         self.root.title("7 Days to Die - Dedicated Server Manager")
-        self.root.geometry("980x720")
-        self.root.minsize(820, 620)
+        self.root.geometry("1000x800")
+        self.root.minsize(860, 680)
 
-        # Thread-safe queue for async logs & status updates
-        self.log_queue: queue.Queue = queue.Queue()
+        # Application core (all business logic) + its thread-safe event queue
+        self.service = service or AugerService(queue.Queue())
+        self.tool_name: str = self.service.tool_name
 
-        # Core Managers
-        self.installer = InstallationManager(self.log_queue)
-        self.config_manager = ConfigManager()
-        self.admin_manager = AdminManager()
-
-        # State Variables
-        self.steamcmd_path: Optional[Path] = None
-        self.server_dir: Optional[Path] = None
+        # Form state
         self.form_entries: Dict[str, Any] = {}   # ttk.Entry OR ttk.Combobox
         self.form_vars: Dict[str, tk.StringVar] = {}
+        self._busy_widgets: List[ttk.Widget] = []
+        self._busy = False
 
         # Admin tab row tracking
-        self._admin_rows: Dict[str, List[Dict[str, Any]]] = {
-            "users": [], "whitelist": [], "blacklist": [], "commands": []
-        }
+        self._admin_rows: Dict[str, List[Dict[str, Any]]] = {key: [] for key in ADMIN_SECTIONS}
 
         # UI StringVars for path displays and status indicators
-        self.steamcmd_path_var = tk.StringVar(value="Searching...")
-        self.steamcmd_status_var = tk.StringVar(value="Checking...")
+        self.tool_path_var = tk.StringVar(value="Searching...")
+        self.tool_status_var = tk.StringVar(value="Checking...")
         self.server_path_var = tk.StringVar(value="Searching...")
         self.server_status_var = tk.StringVar(value="Checking...")
+        self.server_runtime_var = tk.StringVar(value="Stopped")
+        self.progress_label_var = tk.StringVar(value="")
+        self.config_file_var = tk.StringVar(value="")
 
         saved_branch = str(get_saved_value("server_branch", "public")).strip()
         if saved_branch == "public":
@@ -314,32 +134,37 @@ class MainWindow:
         self.custom_branch_var = tk.StringVar(value=custom_branch)
         self.beta_password_var = tk.StringVar()
         self.validate_server_files_var = tk.BooleanVar(
-            value=bool(get_saved_value("validate_server_files", True))
+            value=bool(get_saved_value("validate_server_files", False))
         )
 
         self._build_ui()
 
-        # Start periodic Queue Polling loop
-        self.root.after(50, self.poll_log_queue)
+        # Start periodic event polling loop
+        self.root.after(50, self.poll_events)
 
         # Run initial auto-detection
-        self.root.after(200, self.run_initial_detection)
+        self.root.after(200, lambda: self.service.detect_async(on_done=self._after_detection))
+
+        # Track whether the server we started is still running
+        self.root.after(2000, self._poll_server_process)
 
     def _build_ui(self) -> None:
         """Constructs the notebook tabbed layout."""
+        disable_combobox_wheel(self.root)
+
         header_frame = ttk.Frame(self.root, padding=12)
         header_frame.pack(fill=tk.X)
 
         ttk.Label(
             header_frame,
             text="🎮 7 Days to Die - Dedicated Server Manager",
-            font=("Segoe UI", 14, "bold"),
+            font=(UI_FONT, 14, "bold"),
         ).pack(side=tk.LEFT)
 
         ttk.Label(
             header_frame,
-            text="v1.21 Beta",
-            font=("Segoe UI", 9, "italic"),
+            text=f"v{__version__}",
+            font=(UI_FONT, 9, "italic"),
         ).pack(side=tk.RIGHT, padx=5)
 
         ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X)
@@ -371,23 +196,24 @@ class MainWindow:
 
         r1 = ttk.Frame(paths_group)
         r1.pack(fill=tk.X, pady=4)
-        ttk.Label(r1, text="SteamCMD Location:", width=20, anchor=tk.W).pack(side=tk.LEFT)
-        ttk.Entry(r1, textvariable=self.steamcmd_path_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(r1, text="📁 Browse", command=self.browse_steamcmd).pack(side=tk.LEFT, padx=2)
-        ttk.Button(r1, text="📂 Open Folder", command=self.open_steamcmd_folder).pack(side=tk.LEFT, padx=2)
+        ttk.Label(r1, text=f"{self.tool_name} Location:", width=22, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Entry(r1, textvariable=self.tool_path_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(r1, text="📁 Browse", command=self.browse_tool).pack(side=tk.LEFT, padx=2)
+        ttk.Button(r1, text="📂 Open Folder", command=self.open_tool_folder).pack(side=tk.LEFT, padx=2)
 
         r2 = ttk.Frame(paths_group)
         r2.pack(fill=tk.X, pady=4)
-        ttk.Label(r2, text="7DTD Server Folder:", width=20, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(r2, text="7DTD Server Folder:", width=22, anchor=tk.W).pack(side=tk.LEFT)
         ttk.Entry(r2, textvariable=self.server_path_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        ttk.Button(r2, text="📁 Browse", command=self.browse_server_dir).pack(side=tk.LEFT, padx=2)
+        browse_server_btn = ttk.Button(r2, text="📁 Browse", command=self.browse_server_dir)
+        browse_server_btn.pack(side=tk.LEFT, padx=2)
         ttk.Button(r2, text="📂 Open Folder", command=self.open_server_folder).pack(side=tk.LEFT, padx=2)
 
         r3 = ttk.Frame(paths_group)
         r3.pack(fill=tk.X, pady=(8, 0))
-        ttk.Label(r3, text="SteamCMD Status:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
-        ttk.Label(r3, textvariable=self.steamcmd_status_var, foreground="#0066CC").pack(side=tk.LEFT, padx=(5, 30))
-        ttk.Label(r3, text="7DTD Server Status:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Label(r3, text=f"{self.tool_name} Status:", font=(UI_FONT, 9, "bold")).pack(side=tk.LEFT)
+        ttk.Label(r3, textvariable=self.tool_status_var, foreground="#0066CC").pack(side=tk.LEFT, padx=(5, 30))
+        ttk.Label(r3, text="7DTD Server Status:", font=(UI_FONT, 9, "bold")).pack(side=tk.LEFT)
         ttk.Label(r3, textvariable=self.server_status_var, foreground="#0066CC").pack(side=tk.LEFT, padx=5)
 
         actions_group = ttk.LabelFrame(self.tab_control, text=" Management Actions ", padding=12)
@@ -397,7 +223,7 @@ class MainWindow:
         btn_row1.pack(fill=tk.X, pady=4)
 
         self.btn_dl_steam = ttk.Button(
-            btn_row1, text="⬇️ Download / Update SteamCMD", command=self.action_download_steamcmd,
+            btn_row1, text=f"⬇️ Download / Update {self.tool_name}", command=self.action_download_tool,
         )
         self.btn_dl_steam.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
 
@@ -406,6 +232,12 @@ class MainWindow:
         )
         self.btn_dl_server.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
 
+        progress_row = ttk.Frame(actions_group)
+        progress_row.pack(fill=tk.X, pady=(6, 0))
+        self.progress_bar = ttk.Progressbar(progress_row, mode="determinate", maximum=100)
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Label(progress_row, textvariable=self.progress_label_var, width=28).pack(side=tk.LEFT, padx=4)
+
         version_group = ttk.LabelFrame(
             self.tab_control, text=" Server Version ", padding=12
         )
@@ -413,7 +245,7 @@ class MainWindow:
 
         version_row = ttk.Frame(version_group)
         version_row.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(version_row, text="Version / branch:", width=20, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(version_row, text="Version / branch:", width=22, anchor=tk.W).pack(side=tk.LEFT)
         self.server_branch_selector = ttk.Combobox(
             version_row,
             textvariable=self.server_branch_choice_var,
@@ -425,13 +257,13 @@ class MainWindow:
         self.server_branch_selector.bind("<<ComboboxSelected>>", self._on_branch_selection_changed)
         ttk.Checkbutton(
             version_row,
-            text="Validate files after download",
+            text="Verify all game files (slower; your settings are kept)",
             variable=self.validate_server_files_var,
         ).pack(side=tk.LEFT)
 
         custom_row = ttk.Frame(version_group)
         custom_row.pack(fill=tk.X, pady=2)
-        ttk.Label(custom_row, text="Custom branch:", width=20, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(custom_row, text="Custom branch:", width=22, anchor=tk.W).pack(side=tk.LEFT)
         self.custom_branch_entry = ttk.Entry(
             custom_row, textvariable=self.custom_branch_var, width=28
         )
@@ -440,7 +272,7 @@ class MainWindow:
 
         password_row = ttk.Frame(version_group)
         password_row.pack(fill=tk.X, pady=(2, 0))
-        ttk.Label(password_row, text="Beta password:", width=20, anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Label(password_row, text="Beta password:", width=22, anchor=tk.W).pack(side=tk.LEFT)
         ttk.Entry(password_row, textvariable=self.beta_password_var, show="•", width=28).pack(
             side=tk.LEFT, padx=(0, 12)
         )
@@ -450,15 +282,24 @@ class MainWindow:
         launch_group = ttk.LabelFrame(self.tab_control, text=" Quick Launch ", padding=12)
         launch_group.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(
-            launch_group,
-            text="Launch the 7DTD Dedicated Server from the server installation folder.",
-        ).pack(anchor=tk.W, pady=(0, 10))
+        status_row = ttk.Frame(launch_group)
+        status_row.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(status_row, text="Server is:", font=(UI_FONT, 9, "bold")).pack(side=tk.LEFT)
+        self.server_runtime_label = ttk.Label(
+            status_row, textvariable=self.server_runtime_var, foreground="#7F8C8D",
+            font=(UI_FONT, 9, "bold"),
+        )
+        self.server_runtime_label.pack(side=tk.LEFT, padx=5)
 
         self.btn_start_server = ttk.Button(
             launch_group, text="🚀 START 7DTD SERVER", command=self.action_start_server,
         )
         self.btn_start_server.pack(fill=tk.X, ipady=8)
+
+        # Buttons that must not be used while a download/install is running.
+        self._busy_widgets = [
+            self.btn_dl_steam, self.btn_dl_server, self.btn_start_server, browse_server_btn,
+        ]
 
         log_preview_group = ttk.LabelFrame(self.tab_control, text=" Recent Activity ", padding=8)
         log_preview_group.pack(fill=tk.BOTH, expand=True)
@@ -477,6 +318,11 @@ class MainWindow:
         ttk.Button(btn_bar, text="💾 Save Config", command=self.save_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_bar, text="📋 Reload Config", command=self.load_config_into_ui).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_bar, text="🔄 Reset to Defaults", command=self.reset_config).pack(side=tk.RIGHT, padx=5)
+
+        ttk.Label(
+            self.tab_config, textvariable=self.config_file_var,
+            font=(UI_FONT, 8, "italic"), foreground="#7F8C8D",
+        ).pack(side=tk.BOTTOM, anchor=tk.W, padx=8)
 
         ttk.Separator(self.tab_config, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 4))
 
@@ -497,38 +343,35 @@ class MainWindow:
         canvas.bind("<Configure>", _on_canvas_resize)
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        # Mouse wheel scrolling
-        def _on_mousewheel(event: tk.Event) -> None:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # Mouse wheel scrolling (only while the pointer is over this tab's canvas)
+        bind_mousewheel(canvas)
 
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Build all groups
-        for group_title, field_keys in CONFIG_GROUPS:
-            gbox = ttk.LabelFrame(scroll_frame, text=f" {group_title} ", padding=10)
+        # Build all groups from the schema
+        for group in GROUPS:
+            gbox = ttk.LabelFrame(scroll_frame, text=f" {group.display_title} ", padding=10)
             gbox.pack(fill=tk.X, expand=True, pady=4)
 
             gbox.columnconfigure(0, weight=0, minsize=220)
             gbox.columnconfigure(1, weight=1, minsize=180)
             gbox.columnconfigure(2, weight=2)
 
-            for idx, key in enumerate(field_keys):
-                label_text, tooltip = FIELD_META.get(key, (key + ":", ""))
+            for idx, key in enumerate(group.keys):
+                spec = FIELDS_BY_KEY[key]
 
-                lbl = ttk.Label(gbox, text=label_text, anchor=tk.W)
+                lbl = ttk.Label(gbox, text=spec.label, anchor=tk.W)
                 lbl.grid(row=idx, column=0, sticky="w", padx=(0, 8), pady=3)
 
                 var = tk.StringVar()
                 self.form_vars[key] = var
 
-                if key in DROPDOWN_OPTIONS:
+                if spec.kind == CHOICE:
                     widget = ttk.Combobox(
                         gbox,
                         textvariable=var,
-                        values=DROPDOWN_OPTIONS[key],
+                        values=spec.choice_values,
                         state="readonly",
                     )
                 else:
@@ -539,13 +382,50 @@ class MainWindow:
 
                 tip_lbl = ttk.Label(
                     gbox,
-                    text=tooltip,
-                    font=("Segoe UI", 8, "italic"),
+                    text=spec.help,
+                    font=(UI_FONT, 8, "italic"),
                     foreground="#7F8C8D",
                     wraplength=320,
                     justify=tk.LEFT,
                 )
                 tip_lbl.grid(row=idx, column=2, sticky="w", pady=3)
+
+            if "SandboxCode" in group.keys:
+                self._add_sandbox_helpers(gbox, row=len(group.keys))
+
+    def _add_sandbox_helpers(self, parent: ttk.LabelFrame, row: int) -> None:
+        """Paste + how-to buttons under the Sandbox Code field."""
+        helper_row = ttk.Frame(parent)
+        helper_row.grid(row=row, column=1, columnspan=2, sticky="w", pady=(2, 3))
+        ttk.Button(
+            helper_row, text="📋 Paste from Clipboard", command=self.paste_sandbox_code
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            helper_row, text="❓ How do I get a code?",
+            command=lambda: SandboxCodeHelpDialog(self.root),
+        ).pack(side=tk.LEFT)
+
+    def paste_sandbox_code(self) -> None:
+        try:
+            raw = self.root.clipboard_get()
+        except tk.TclError:
+            messagebox.showwarning(
+                "Clipboard Empty",
+                "Nothing to paste. In the game's Sandbox Options screen, click Copy first.",
+                parent=self.root,
+            )
+            return
+        code = normalize_sandbox_code(raw)
+        if not code:
+            messagebox.showwarning(
+                "Not a Sandbox Code",
+                "The clipboard doesn't contain a Sandbox Code. Copy it from the game's "
+                "Sandbox Options screen and try again.",
+                parent=self.root,
+            )
+            return
+        self.form_vars["SandboxCode"].set(code)
+        self.log_message("Sandbox Code pasted. Click 💾 Save Config to apply it.", "SUCCESS")
 
     # ------------------------------------------------------------------
     # TAB 3: SERVER ADMIN
@@ -576,10 +456,7 @@ class MainWindow:
         canvas.bind("<Configure>", _on_canvas_resize)
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        def _on_mousewheel(event: tk.Event) -> None:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        bind_mousewheel(canvas)
 
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -639,7 +516,7 @@ class MainWindow:
             ttk.Label(
                 frame,
                 text=section_desc,
-                font=("Segoe UI", 8, "italic"),
+                font=(UI_FONT, 8, "italic"),
                 foreground="#7F8C8D",
                 wraplength=820,
                 justify=tk.LEFT,
@@ -648,7 +525,7 @@ class MainWindow:
         header_row = ttk.Frame(frame)
         header_row.pack(fill=tk.X)
         for col_title in columns:
-            ttk.Label(header_row, text=col_title, font=("Segoe UI", 9, "bold"), anchor=tk.W).pack(
+            ttk.Label(header_row, text=col_title, font=(UI_FONT, 9, "bold"), anchor=tk.W).pack(
                 side=tk.LEFT, expand=True, fill=tk.X, padx=3
             )
         ttk.Label(header_row, text="", width=8).pack(side=tk.LEFT)
@@ -660,7 +537,7 @@ class MainWindow:
             ttk.Label(
                 tip_row,
                 text=tip_text,
-                font=("Segoe UI", 8, "italic"),
+                font=(UI_FONT, 8, "italic"),
                 foreground="#7F8C8D",
                 wraplength=160,
                 justify=tk.LEFT,
@@ -783,125 +660,101 @@ class MainWindow:
         ttk.Button(bar, text="💾 Save Logs to File", command=self.save_logs_to_file).pack(side=tk.LEFT, padx=4)
 
     # ------------------------------------------------------------------
-    # QUEUE POLLING & LOG DISPATCH
+    # SERVICE EVENTS
     # ------------------------------------------------------------------
-    def poll_log_queue(self) -> None:
-        """Reads async events sent from background threads and updates UI elements."""
-        processed = 0
-        try:
-            while processed < 200:
-                item = self.log_queue.get_nowait()
-                msg_type = item[0]
+    def poll_events(self) -> None:
+        """Render events from the service (runs on the Tk thread)."""
+        self.service.dispatch_pending(self._handle_event, limit=200)
+        self.root.after(50, self.poll_events)
 
-                if msg_type == "log":
-                    _, level, message = item
-                    self.mini_logger.append_log(message, level)
-                    self.main_logger.append_log(message, level)
+    def _handle_event(self, event: tuple) -> None:
+        kind = event[0]
+        if kind == "log":
+            _, level, message = event
+            self.mini_logger.append_log(message, level)
+            self.main_logger.append_log(message, level)
+        elif kind == "status":
+            _, component, text = event
+            if component == "tool":
+                self.tool_status_var.set(text)
+            elif component == "server":
+                self.server_status_var.set(text)
+        elif kind == "progress":
+            _, component, percent = event
+            self._show_progress(component, percent)
+        elif kind == "busy":
+            self._set_busy(bool(event[1]))
+        elif kind == "changed":
+            what = event[1]
+            if what == "tool":
+                self._refresh_tool_path()
+            elif what == "server":
+                self._refresh_server_path()
+                self._refresh_runtime()
+            elif what == "config":
+                self.load_config_into_ui()
+            elif what == "admin":
+                self.load_admin_into_ui()
+            elif what == "runtime":
+                self._refresh_runtime()
 
-                elif msg_type == "status":
-                    _, component, status_val = item
-                    if component == "steamcmd":
-                        self.steamcmd_status_var.set(status_val)
-                    elif component == "server":
-                        self.server_status_var.set(status_val)
+    def _show_progress(self, component: str, percent: Optional[float]) -> None:
+        if percent is None:
+            self.progress_bar["value"] = 0
+            self.progress_label_var.set("")
+            return
+        self.progress_bar["value"] = percent
+        what = self.tool_name if component == "tool" else "Server files"
+        self.progress_label_var.set(f"{what}: {percent:.0f}%")
 
-                self.log_queue.task_done()
-                processed += 1
-        except queue.Empty:
-            pass
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        state = tk.DISABLED if busy else tk.NORMAL
+        for widget in self._busy_widgets:
+            try:
+                widget.config(state=state)
+            except tk.TclError:
+                pass
+        if not busy:
+            self._refresh_runtime()
 
-        self.root.after(50, self.poll_log_queue)
+    def _refresh_tool_path(self) -> None:
+        path = self.service.tool_path
+        self.tool_path_var.set(str(path) if path else "Not installed yet")
 
-    # ------------------------------------------------------------------
-    # DETECTION & INITIALIZATION
-    # ------------------------------------------------------------------
-    def run_initial_detection(self) -> None:
-        """Executes initial SteamCMD and 7DTD server discovery."""
-        self.log_message("Scanning environment for SteamCMD & 7DTD Dedicated Server...", "INFO")
+    def _refresh_server_path(self) -> None:
+        server_dir = self.service.server_dir
+        suffix = "" if self.service.server_installed() else "   (not installed yet)"
+        self.server_path_var.set(f"{server_dir}{suffix}")
 
-        saved_steamcmd = get_saved_path("steamcmd_path")
-        saved_server = get_saved_path("server_dir")
-
-        steam_bin = saved_steamcmd or find_steamcmd()
-        if steam_bin:
-            self.steamcmd_path = steam_bin
-            self.steamcmd_path_var.set(str(steam_bin))
-            self.steamcmd_status_var.set("Ready")
-            source = "saved settings" if saved_steamcmd else "auto-detection"
-            self.log_message(f"SteamCMD located via {source}: {steam_bin}", "SUCCESS")
+    def _refresh_runtime(self) -> None:
+        running = self.service.server_running()
+        if running:
+            self.server_runtime_var.set(f"Running (PID {self.service.server_pid})")
+            self.server_runtime_label.config(foreground="#27AE60")
         else:
-            self.steamcmd_path_var.set("Not Found")
-            self.steamcmd_status_var.set("Missing")
-            self.log_message("SteamCMD executable not found.", "WARNING")
+            self.server_runtime_var.set("Stopped")
+            self.server_runtime_label.config(foreground="#7F8C8D")
+        if not self._busy:
+            can_start = (not running) and self.service.server_installed()
+            self.btn_start_server.config(state=tk.NORMAL if can_start else tk.DISABLED)
 
-        server_dir = saved_server or find_7dtd_server(steamcmd_path=self.steamcmd_path)
-        if server_dir:
-            self._set_server_dir(server_dir, from_saved=bool(saved_server))
-        else:
-            default_target = get_app_dir() / "7dtd_server"
-            self.server_dir = default_target
-            self.server_path_var.set(f"Default: {default_target}")
-            self.server_status_var.set("Not Installed")
-            self.log_message("7DTD Server not found in standard paths.", "INFO")
+    def _poll_server_process(self) -> None:
+        self.service.poll_server()
+        self._refresh_runtime()
+        self.root.after(2000, self._poll_server_process)
 
-        if not self.steamcmd_path:
-            modal = SteamCMDMissingModal(self.root)
+    def _after_detection(self) -> None:
+        self._refresh_tool_path()
+        self._refresh_server_path()
+        self._refresh_runtime()
+        if not self.service.tool_ready():
+            modal = SteamCMDMissingModal(self.root, tool_name=self.tool_name)
             self.root.wait_window(modal)
             if modal.user_choice == "download":
-                self.action_download_steamcmd()
+                self.action_download_tool()
             elif modal.user_choice == "browse" and modal.selected_path:
-                p = Path(modal.selected_path).resolve()
-                self._set_steamcmd_path(p)
-
-    def _set_steamcmd_path(self, path: Path) -> None:
-        self.steamcmd_path = path
-        self.steamcmd_path_var.set(str(path))
-        self.steamcmd_status_var.set("Ready")
-        save_settings(steamcmd_path=path)
-        self.log_message(f"SteamCMD path set to: {path}", "INFO")
-
-    def _set_server_dir(self, path: Path, from_saved: bool = False) -> None:
-        self.server_dir = path
-        self.server_path_var.set(str(path))
-        self.server_status_var.set("Installed & Ready")
-        save_settings(server_dir=path)
-        source = "saved settings" if from_saved else "auto-detection"
-        self.log_message(f"7DTD Dedicated Server located via {source}: {path}", "SUCCESS")
-        self.config_manager.set_config_path(path / "serverconfig.xml")
-        self.load_config_into_ui()
-
-    def _init_admin_manager(self, server_dir: Path) -> None:
-        """
-        Configure serverconfig.xml folder paths, create serveradmin.xml if missing,
-        and load it into the admin editor.
-        """
-        try:
-            config_path = server_dir / "serverconfig.xml"
-            self.config_manager.set_config_path(config_path)
-
-            layout_updates = self.config_manager.ensure_server_folder_layout(server_dir, make_backup=False)
-            for key, value in layout_updates.items():
-                if key in self.form_vars:
-                    self.form_vars[key].set(value)
-
-            settings = self.config_manager.load_config()
-            admin_path = resolve_admin_file_path(server_dir, settings)
-
-            self.admin_manager.set_path(admin_path)
-            created = not admin_path.exists()
-            self.admin_manager.ensure_exists(server_dir=server_dir, settings=settings)
-
-            if created:
-                self.log_message(
-                    f"serveradmin.xml did not exist — created at: {admin_path}", "INFO"
-                )
-
-            self.admin_manager.load()
-            self.load_admin_into_ui()
-            self.log_message(f"Loaded serveradmin.xml from: {admin_path}", "SUCCESS")
-
-        except Exception as err:
-            self.log_message(f"Could not initialize admin file: {err}", "WARNING")
+                self.service.set_tool_path(Path(modal.selected_path).resolve())
 
     def log_message(self, message: str, level: str = "INFO") -> None:
         self.mini_logger.append_log(message, level)
@@ -910,53 +763,33 @@ class MainWindow:
     # ------------------------------------------------------------------
     # ACTIONS & EVENT HANDLERS
     # ------------------------------------------------------------------
-    def browse_steamcmd(self) -> None:
+    def browse_tool(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select steamcmd.exe or steamcmd.sh",
-            filetypes=[("SteamCMD Executable", "steamcmd.exe;steamcmd.sh;steamcmd"), ("All Files", "*.*")],
+            parent=self.root,
+            title=f"Select the {self.tool_name} program",
+            filetypes=[(f"{self.tool_name} program", "*")],
         )
         if path:
-            self._set_steamcmd_path(Path(path).resolve())
+            self.service.set_tool_path(Path(path).resolve())
 
     def browse_server_dir(self) -> None:
-        path = filedialog.askdirectory(title="Select 7DTD Server Directory")
+        path = filedialog.askdirectory(parent=self.root, title="Select 7DTD Server Directory")
         if path:
-            p = Path(path).resolve()
-            self.log_message(f"Updated 7DTD Server folder to: {p}", "INFO")
+            self.service.set_server_dir(Path(path).resolve())
 
-            config_file = p / "serverconfig.xml"
-            if not config_file.exists():
-                self.config_manager.generate_default_file(config_file)
-                self.log_message("Created default serverconfig.xml in selected folder.", "INFO")
-
-            self._set_server_dir(p)
-
-    def open_steamcmd_folder(self) -> None:
-        target = self.steamcmd_path.parent if self.steamcmd_path else (get_app_dir() / "steamcmd")
+    def open_tool_folder(self) -> None:
+        target = self.service.tool_path.parent if self.service.tool_ready() else self.service.default_tool_dir()
         if not open_folder(target):
-            messagebox.showwarning("Folder Missing", f"Folder does not exist: {target}")
+            messagebox.showwarning("Folder Missing", f"Folder does not exist yet: {target}")
 
     def open_server_folder(self) -> None:
-        target = self.server_dir if self.server_dir else (get_app_dir() / "7dtd_server")
+        target = self.service.server_dir
         if not open_folder(target):
-            messagebox.showwarning("Folder Missing", f"Folder does not exist: {target}")
+            messagebox.showwarning("Folder Missing", f"Folder does not exist yet: {target}")
 
-    def action_download_steamcmd(self) -> None:
-        initial_dir = self.steamcmd_path.parent if self.steamcmd_path else (get_app_dir() / "steamcmd")
-        target_dir_str = filedialog.askdirectory(
-            title="Select SteamCMD Installation Folder",
-            initialdir=str(initial_dir),
-        )
-        if not target_dir_str:
-            return
-
-        target_dir = Path(target_dir_str).resolve()
-
-        def _on_done(steam_path: Optional[Path]):
-            if steam_path:
-                self._set_steamcmd_path(steam_path)
-
-        self.installer.download_and_setup_steamcmd_async(target_dir=target_dir, on_complete=_on_done)
+    def action_download_tool(self) -> None:
+        """Download (or refresh) the download tool into its folder — no folder picker needed."""
+        self.service.download_tool_async()
 
     def _on_branch_selection_changed(self, event: Optional[tk.Event] = None) -> None:
         """Enables or disables the custom branch entry based on current dropdown selection."""
@@ -967,7 +800,7 @@ class MainWindow:
             self.custom_branch_entry.config(state=tk.DISABLED)
 
     def get_selected_branch(self) -> Optional[str]:
-        """Returns the normalized branch name to use for SteamCMD, or None if invalid."""
+        """Returns the normalized branch name to download, or None if invalid."""
         choice = self.server_branch_choice_var.get()
         if choice == SERVER_BRANCH_CUSTOM:
             branch = self.custom_branch_var.get().strip()
@@ -981,208 +814,119 @@ class MainWindow:
         return SERVER_BRANCH_VALUES.get(choice, "public")
 
     def action_install_server(self) -> None:
-        if not self.steamcmd_path or not self.steamcmd_path.exists():
-            messagebox.showerror(
-                "SteamCMD Required",
-                "SteamCMD must be downloaded or located before installing the game server.",
-            )
-            return
+        """Install or update the server into the current server folder — no folder picker needed.
 
+        Use the Browse button next to "7DTD Server Folder" first to pick a different location.
+        """
         branch = self.get_selected_branch()
         if not branch:
             return
-
-        beta_password = self.beta_password_var.get().strip() or None
-        validate = self.validate_server_files_var.get()
-
-        target_dir: Optional[Path] = None
-
-        _server_binary = get_executable_name("7DaysToDieServer")
-        if self.server_dir and self.server_dir.exists() and (
-            (self.server_dir / _server_binary).exists()
-            or (self.server_dir / "startdedicated.bat").exists()
-            or (self.server_dir / "startserver.bat").exists()
-        ):
-            use_detected = messagebox.askyesno(
-                "Detected Server Location",
-                f"An existing 7DTD Dedicated Server installation was found at:\n\n{self.server_dir}\n\nWould you like to use this folder?",
-                icon="question",
+        try:
+            self.service.install_server_async(
+                branch=branch,
+                beta_password=self.beta_password_var.get().strip() or None,
+                validate=self.validate_server_files_var.get(),
             )
-            if use_detected:
-                target_dir = self.server_dir
-            else:
-                default_new_dir = get_app_dir() / "7dtd_server"
-                target_dir_str = filedialog.askdirectory(
-                    title="Select 7DTD Dedicated Server Download Folder",
-                    initialdir=str(default_new_dir),
-                )
-                if not target_dir_str:
-                    return
-                target_dir = Path(target_dir_str).resolve()
-        else:
-            initial_dir = self.server_dir if self.server_dir else (get_app_dir() / "7dtd_server")
-            target_dir_str = filedialog.askdirectory(
-                title="Select 7DTD Dedicated Server Download Folder",
-                initialdir=str(initial_dir),
-            )
-            if not target_dir_str:
-                return
-            target_dir = Path(target_dir_str).resolve()
-
-        save_settings(server_branch=branch, validate_server_files=validate)
-
-        def _on_done(success: bool):
-            if success:
-                self._set_server_dir(target_dir)
-
-        self.installer.install_or_update_server_async(
-            steamcmd_path=self.steamcmd_path,
-            server_dir=target_dir,
-            branch=branch,
-            beta_password=beta_password,
-            validate=validate,
-            on_complete=_on_done,
-        )
+        except ServiceError as err:
+            messagebox.showerror("Can't Install Yet", str(err))
 
     def action_start_server(self) -> None:
-        if not self.server_dir or not self.server_dir.exists():
-            messagebox.showerror("Error", "7DTD Server directory does not exist.")
-            return
-
-        bat_file = self.server_dir / "startdedicated.bat"
-        fallback_bat = self.server_dir / "startserver.bat"
-        exe_file = self.server_dir / get_executable_name("7DaysToDieServer")
-
-        if bat_file.exists():
-            self.log_message(f"Launching batch script: {bat_file}", "INFO")
-            if not launch_batch_in_new_window(bat_file, cwd=self.server_dir):
-                messagebox.showerror("Launch Failed", f"Could not start {bat_file.name}.")
-                return
-            messagebox.showinfo("Server Started", "Server launched via startdedicated.bat in a new console window.")
-        elif fallback_bat.exists():
-            self.log_message(f"Launching batch script: {fallback_bat}", "INFO")
-            if not launch_batch_in_new_window(fallback_bat, cwd=self.server_dir):
-                messagebox.showerror("Launch Failed", f"Could not start {fallback_bat.name}.")
-                return
-            messagebox.showinfo("Server Started", "Server launched via startserver.bat in a new console window.")
-        elif exe_file.exists():
-            cmd = [str(exe_file), "-logfile", "7DaysToDieServer_Data/output_log.txt", "-configfile=serverconfig.xml"]
-            self.log_message(f"Launching executable: {' '.join(cmd)}", "INFO")
-            launch_detached_process(cmd, cwd=self.server_dir)
-            messagebox.showinfo("Server Started", f"Server launched: {exe_file.name}")
-        else:
-            _binary_name = get_executable_name("7DaysToDieServer")
-            messagebox.showerror(
-                "Binary Not Found",
-                f"Could not locate startdedicated.bat, startserver.bat, or {_binary_name}.",
-            )
+        try:
+            self.service.start_server()
+        except ServiceError as err:
+            messagebox.showerror("Launch Failed", str(err))
+        self._refresh_runtime()
 
     # ------------------------------------------------------------------
-    # CONFIG MANAGER INTEGRATION
+    # CONFIGURATION
     # ------------------------------------------------------------------
     def load_config_into_ui(self) -> None:
-        if not self.server_dir:
-            return
-
-        config_path = self.server_dir / "serverconfig.xml"
-        if not config_path.exists():
-            self.log_message("serverconfig.xml not found. Creating default template...", "WARNING")
-            self.config_manager.generate_default_file(config_path)
-
-        self.config_manager.set_config_path(config_path)
-
         try:
-            settings = self.config_manager.load_config()
-            for key, var in self.form_vars.items():
-                var.set(settings.get(key, ""))
-            self.log_message(f"Loaded configuration settings from {config_path.name}", "SUCCESS")
-            self._init_admin_manager(self.server_dir)
+            settings = self.service.load_config()
         except Exception as err:
             self.log_message(f"Error loading config: {err}", "ERROR")
+            return
+        if settings is None:
+            for var in self.form_vars.values():
+                var.set("")
+            self.config_file_var.set(
+                f"Settings appear here once the server is installed ({server_binary_name()} not found yet)."
+            )
+            return
+        for key, var in self.form_vars.items():
+            var.set(settings.get(key, ""))
+        self.config_file_var.set(f"Editing: {self.service.config_path}")
 
     def save_config(self) -> None:
-        if not self.server_dir:
-            messagebox.showerror("Error", "No server directory selected.")
-            return
-
-        config_path = self.server_dir / "serverconfig.xml"
-        self.config_manager.set_config_path(config_path)
-
-        new_settings = {key: var.get() for key, var in self.form_vars.items()}
-
+        values = {key: var.get() for key, var in self.form_vars.items()}
         try:
-            self.config_manager.save_config(new_settings, make_backup=True)
-            self.log_message("Saved updated serverconfig.xml with timestamped backup!", "SUCCESS")
-            messagebox.showinfo("Config Saved", "serverconfig.xml successfully updated!\nA backup copy was created.")
+            saved = self.service.save_config(values)
+        except ServiceError as err:
+            messagebox.showerror("Can't Save Settings", str(err))
+            return
         except Exception as err:
             self.log_message(f"Error saving config: {err}", "ERROR")
             messagebox.showerror("Save Failed", f"Could not save configuration: {err}")
+            return
+        if "SandboxCode" in saved:
+            self.form_vars["SandboxCode"].set(saved["SandboxCode"])
+        messagebox.showinfo("Config Saved", "Settings saved!\nA backup copy was created.")
 
     def reset_config(self) -> None:
         confirm = messagebox.askyesno(
             "Confirm Reset",
-            "Are you sure you want to reset serverconfig.xml to default settings?\n\nA backup copy of your existing configuration will be saved.",
+            "Are you sure you want to reset the server settings to defaults?\n\n"
+            "A backup copy of your existing configuration will be saved, and your worlds stay where they are.",
             icon="warning",
         )
-        if confirm:
-            try:
-                self.config_manager.reset_to_defaults(make_backup=True)
-                self.load_config_into_ui()
-                self.log_message("Configuration reset to default settings.", "SUCCESS")
-                messagebox.showinfo("Reset Complete", "Configuration successfully restored to default settings.")
-            except Exception as err:
-                self.log_message(f"Error resetting config: {err}", "ERROR")
+        if not confirm:
+            return
+        try:
+            self.service.reset_config()
+        except ServiceError as err:
+            messagebox.showerror("Can't Reset", str(err))
+            return
+        except Exception as err:
+            self.log_message(f"Error resetting config: {err}", "ERROR")
+            return
+        messagebox.showinfo("Reset Complete", "Configuration successfully restored to default settings.")
 
     # ------------------------------------------------------------------
-    # ADMIN MANAGER INTEGRATION
+    # ADMIN FILE
     # ------------------------------------------------------------------
     def load_admin_into_ui(self) -> None:
-        """Populate all admin section rows from admin_manager's in-memory lists."""
-        if not self.admin_manager.admin_path:
-            return
-
+        """Populate all admin section rows from the service's admin lists."""
         # Clear existing rows in each section
-        for section_key in ("users", "whitelist", "blacklist", "commands"):
+        for section_key in ADMIN_SECTIONS:
             for row_record in list(self._admin_rows[section_key]):
                 row_record["frame"].destroy()
             self._admin_rows[section_key] = []
 
-        for entry in self.admin_manager.users:
-            self._add_admin_row("users", initial_values=entry)
-
-        for entry in self.admin_manager.whitelist:
-            self._add_admin_row("whitelist", initial_values=entry)
-
-        for entry in self.admin_manager.blacklist:
-            self._add_admin_row("blacklist", initial_values=entry)
-
-        for entry in self.admin_manager.commands:
-            self._add_admin_row("commands", initial_values=entry)
-
-    def save_admin(self) -> None:
-        if not self.server_dir:
-            messagebox.showerror("Error", "No server directory selected.")
+        if not self.service.admin_ready():
             return
 
-        settings = {key: var.get() for key, var in self.form_vars.items()}
-        admin_path = resolve_admin_file_path(self.server_dir, settings)
-        self.admin_manager.set_path(admin_path)
+        admin = self.service.admin
+        for section_key, entries in (
+            ("users", admin.users),
+            ("whitelist", admin.whitelist),
+            ("blacklist", admin.blacklist),
+            ("commands", admin.commands),
+        ):
+            for entry in entries:
+                self._add_admin_row(section_key, initial_values=entry)
 
-        if not admin_path.exists():
-            self.admin_manager.ensure_exists(server_dir=self.server_dir, settings=settings)
-
+    def save_admin(self) -> None:
         try:
-            self.admin_manager.users = self._collect_admin_section("users")
-            self.admin_manager.whitelist = self._collect_admin_section("whitelist")
-            self.admin_manager.blacklist = self._collect_admin_section("blacklist")
-            self.admin_manager.commands = self._collect_admin_section("commands")
-
-            self.admin_manager.save()
-            self.log_message(f"Saved serveradmin.xml to {self.admin_manager.admin_path}", "SUCCESS")
-            messagebox.showinfo("Admin Saved", "serveradmin.xml successfully updated!\nA backup was created.")
-        except Exception as err:
-            self.log_message(f"Error saving admin file: {err}", "ERROR")
-            messagebox.showerror("Save Failed", f"Could not save serveradmin.xml: {err}")
+            self.service.save_admin(
+                users=self._collect_admin_section("users"),
+                whitelist=self._collect_admin_section("whitelist"),
+                blacklist=self._collect_admin_section("blacklist"),
+                commands=self._collect_admin_section("commands"),
+            )
+        except ServiceError as err:
+            messagebox.showerror("Can't Save Admin File", str(err))
+            return
+        messagebox.showinfo("Admin Saved", "serveradmin.xml successfully updated!\nA backup was created.")
 
     # ------------------------------------------------------------------
     # LOG UTILITIES

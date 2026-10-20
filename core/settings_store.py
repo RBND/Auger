@@ -49,6 +49,7 @@ def save_settings(
     server_dir: Optional[Path] = None,
     server_branch: Optional[str] = None,
     validate_server_files: Optional[bool] = None,
+    depotdownloader_path: Optional[Path] = None,
 ) -> None:
     """Persist non-secret settings using an atomic file replacement.
 
@@ -58,6 +59,9 @@ def save_settings(
 
     if steamcmd_path is not None:
         data["steamcmd_path"] = str(Path(steamcmd_path).resolve())
+
+    if depotdownloader_path is not None:
+        data["depotdownloader_path"] = str(Path(depotdownloader_path).resolve())
 
     if server_dir is not None:
         data["server_dir"] = str(Path(server_dir).resolve())

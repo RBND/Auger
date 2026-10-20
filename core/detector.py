@@ -10,7 +10,13 @@ import string
 from pathlib import Path
 from typing import Optional, List, Union
 
-from .utils import get_app_dir, get_executable_name
+from .utils import (
+    depotdownloader_binary_name,
+    get_app_dir,
+    get_data_dir,
+    server_binary_name,
+    steamcmd_binary_name,
+)
 
 
 def get_available_drives() -> List[Path]:
@@ -29,6 +35,40 @@ def get_available_drives() -> List[Path]:
     return drives
 
 
+def find_depotdownloader(custom_hint_path: Optional[Union[Path, str]] = None) -> Optional[Path]:
+    """Locate a DepotDownloader binary in Auger's folders, a hint path, or PATH."""
+    exe_name = depotdownloader_binary_name()
+    candidates: List[Path] = []
+    if custom_hint_path:
+        hint = Path(custom_hint_path)
+        candidates.append(hint / exe_name if hint.is_dir() else hint)
+    candidates.extend(
+        [
+            get_data_dir() / "depotdownloader" / exe_name,
+            get_app_dir() / "depotdownloader" / exe_name,
+        ]
+    )
+    for which_name in ("DepotDownloader", "depotdownloader"):
+        which_path = shutil.which(which_name)
+        if which_path:
+            candidates.append(Path(which_path))
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate.resolve()
+        except (PermissionError, OSError):
+            continue
+    return None
+
+
+def find_download_tool(tool: str, custom_hint_path: Optional[Union[Path, str]] = None) -> Optional[Path]:
+    """Locate the download tool ("steamcmd" or "depotdownloader")."""
+    if tool == "steamcmd":
+        return find_steamcmd(custom_hint_path)
+    return find_depotdownloader(custom_hint_path)
+
+
 def find_steamcmd(custom_hint_path: Optional[Union[Path, str]] = None) -> Optional[Path]:
     """
     Scans relative project directories, system PATH, and all available drive roots
@@ -37,7 +77,7 @@ def find_steamcmd(custom_hint_path: Optional[Union[Path, str]] = None) -> Option
     Returns the absolute Path to steamcmd executable if found, or None.
     """
     app_dir = get_app_dir()
-    exe_name = get_executable_name("steamcmd")
+    exe_name = steamcmd_binary_name()
 
     search_candidates: List[Path] = []
 
@@ -49,9 +89,10 @@ def find_steamcmd(custom_hint_path: Optional[Union[Path, str]] = None) -> Option
         else:
             search_candidates.append(hint)
 
-    # 2. Relative project paths
+    # 2. Auger's per-user data folder and relative project paths
     search_candidates.extend(
         [
+            get_data_dir() / "steamcmd" / exe_name,
             app_dir / "steamcmd" / exe_name,
             app_dir / exe_name,
             app_dir / "SteamCMD" / exe_name,
@@ -122,7 +163,7 @@ def find_7dtd_server(
     """
     app_dir = get_app_dir()
     is_windows = platform.system() == "Windows"
-    binary_name = "7DaysToDieServer.exe" if is_windows else "7DaysToDieServer.x86_64"
+    binary_name = server_binary_name()
 
     search_dirs: List[Path] = []
 
@@ -130,9 +171,11 @@ def find_7dtd_server(
     if custom_hint_path:
         search_dirs.append(Path(custom_hint_path).resolve())
 
-    # 2. Relative project directories
+    # 2. Auger's default install folders, then relative project directories
     search_dirs.extend(
         [
+            get_data_dir() / "instances" / "default" / "server",
+            get_data_dir() / "7dtd_server",
             app_dir / "7dtd_server",
             app_dir / "7 Days To Die Dedicated Server",
             app_dir,
@@ -176,21 +219,10 @@ def find_7dtd_server(
             ]
         )
 
-    # Inspect search directories
+    # Inspect search directories: the server program for this OS must be present.
     for sdir in search_dirs:
         try:
-            if not sdir.exists() or not sdir.is_dir():
-                continue
-
-            # Check if directory contains server executable or start script
-            exe_file = sdir / binary_name
-            config_file = sdir / "serverconfig.xml"
-            bat_file = sdir / "startdedicated.bat"
-            legacy_bat = sdir / "startserver.bat"
-
-            if (exe_file.is_file() or bat_file.is_file() or legacy_bat.is_file()) and config_file.is_file():
-                return sdir.resolve()
-            elif exe_file.is_file():
+            if (sdir / binary_name).is_file():
                 return sdir.resolve()
         except (PermissionError, OSError):
             continue
